@@ -1,0 +1,29 @@
+[package]
+name = "dkg-documents"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+description = "Searchable semistructured document store for DurableKG (feature A)"
+
+[dependencies]
+dkg-core.workspace = true
+opendal.workspace = true
+fjall.workspace = true
+tantivy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+inventory.workspace = true
+thiserror.workspace = true
+async-trait = "0.1"
+tokio = { workspace = true }
+async-channel = "2"
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+tempfile = "3"

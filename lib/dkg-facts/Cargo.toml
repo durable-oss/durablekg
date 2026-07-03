@@ -1,0 +1,24 @@
+[package]
+name = "dkg-facts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+description = "Authority-stamped fact store for DurableKG graph entities"
+
+[dependencies]
+dkg-core.workspace = true
+dkg-documents.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+async-trait = "0.1"
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+tokio = { workspace = true }
+tempfile = "3"

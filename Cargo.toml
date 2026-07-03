@@ -1,0 +1,93 @@
+[workspace]
+resolver = "2"
+members = [
+    "lib/dkg-core",
+    "lib/dkg-documents",
+    "lib/dkg-config",
+    "lib/dkg-graph",
+    "lib/dkg-endpoints",
+    "lib/dkg-jobs",
+    "lib/dkg-facts",
+    "lib/dkg-entity-fact-resolver",
+    "apps/dkg-server",
+    "apps/dkg-cli",
+    "demos/prospects-tui",
+]
+# Trongoscript brings its own workspace; keep it out of ours so its
+# `*.workspace = true` inheritances resolve against its own root.
+exclude = ["external"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+authors = ["Durable Programming <hello@durableprogramming.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/durable-oss/durablekg"
+documentation = "https://docs.rs/durablekg"
+
+[workspace.dependencies]
+# Internal crates
+dkg-core = { path = "lib/dkg-core" }
+dkg-documents = { path = "lib/dkg-documents" }
+dkg-config = { path = "lib/dkg-config" }
+dkg-graph = { path = "lib/dkg-graph" }
+dkg-endpoints = { path = "lib/dkg-endpoints" }
+dkg-jobs = { path = "lib/dkg-jobs" }
+dkg-facts = { path = "lib/dkg-facts" }
+dkg-entity-fact-resolver = { path = "lib/dkg-entity-fact-resolver" }
+
+# Trongoscript (config language) — built from its own workspace via path.
+trongoscript = { path = "external/trongoscript/crates/trongoscript" }
+
+# Async runtime + web
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["json", "macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+
+# Storage — feature A document store is a composite of three layers:
+#   opendal: blob storage for document bodies (filesystem or object store)
+#   fjall:   embedded LSM key/value store for metadata + URN search indexes
+#   tantivy: full-text search over document bodies and metadata
+opendal = { version = "0.57", features = ["services-fs", "services-s3"] }
+fjall = "3.1"
+tantivy = "0.22"
+# Knowledge graph (feature B) backend.
+clickhouse = { version = "0.13", features = ["uuid", "chrono"] }
+
+# Plugin / registry pattern — used across the workspace for extensibility.
+inventory = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Identifiers, time, logging
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# HTTP client (used by the endpoints crate, feature C)
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+
+# Testing
+pretty_assertions = "1.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

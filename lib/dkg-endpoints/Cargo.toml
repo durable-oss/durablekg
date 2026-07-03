@@ -1,0 +1,25 @@
+[package]
+name = "dkg-endpoints"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+description = "User-defined caching API endpoints for DurableKG (feature C)"
+
+[dependencies]
+dkg-core.workspace = true
+dkg-config.workspace = true
+dkg-documents.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+async-trait = "0.1"
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+tokio.workspace = true
+tempfile = "3"

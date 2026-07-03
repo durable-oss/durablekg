@@ -1,0 +1,29 @@
+[package]
+name = "dkg-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "DurableKG command-line interface"
+
+[[bin]]
+name = "dkg"
+path = "src/main.rs"
+
+[dependencies]
+dkg-core.workspace = true
+dkg-config.workspace = true
+dkg-documents.workspace = true
+dkg-graph.workspace = true
+dkg-endpoints.workspace = true
+dkg-facts.workspace = true
+dkg-entity-fact-resolver.workspace = true
+clap.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+anyhow.workspace = true
