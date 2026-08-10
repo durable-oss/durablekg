@@ -13,13 +13,13 @@ use dkg_config::Endpoint;
 use dkg_documents::{Document, DocumentStore, NewDocument, Query, Urn};
 use dkg_endpoints::{CallRequest, EnvSecrets, HttpFetcher};
 use dkg_entity_fact_resolver::{resolve_entity, sync_entity};
-use dkg_facts::{DocumentFactStore, FactStore, NewFact};
+use dkg_facts::{DocumentFactStore, Fact, FactStore, NewBundle, NewFact};
 use dkg_graph::{Filter, GraphStore, Op, OrderBy, Record, Schema, SortDirection};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::auth::require_api_key;
-use crate::error::ApiError;
+use crate::error::{ApiError, BatchError, BatchOutcome};
 
 /// The relational store and its loaded schema (feature B), present only when
 /// the server was configured with a graph database and tables.
@@ -85,6 +85,7 @@ pub fn router(state: AppState) -> Router {
     let authenticated = Router::new()
         .route("/v1/config/validate", post(validate_config))
         .route("/v1/documents", post(create_document))
+        .route("/v1/documents/batch", post(create_documents_batch))
         .route("/v1/documents/search", post(search_documents))
         .route("/v1/documents/by-urn/:urn", get(get_document_by_urn))
         .route(
@@ -102,6 +103,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/endpoints/:name", get(call_endpoint))
         .route("/v1/facts", get(list_facts).post(record_fact))
+        .route("/v1/facts/batch", post(record_facts_batch))
         .route("/v1/facts/resolve", post(resolve_facts))
         .route("/v1/facts/sync", post(sync_facts))
         .route_layer(middleware::from_fn_with_state(
@@ -137,6 +139,28 @@ async fn create_document(
     Json(doc): Json<NewDocument>,
 ) -> Result<Json<Document>, ApiError> {
     Ok(Json(state.store.create(doc).await?))
+}
+
+/// Create many documents in one request.
+///
+/// Body is an array of [`NewDocument`] (a bare object is also accepted, as a
+/// batch of one). By default every document is attempted and the failures are
+/// reported per item; add `?on_error=stop` to halt at the first one. See
+/// [`run_batch`] for the shared semantics.
+///
+/// This is a convenience over [`create_document`], not a faster path — the
+/// store writes one document per call either way.
+async fn create_documents_batch(
+    State(state): State<AppState>,
+    AxumQuery(mode): AxumQuery<BatchMode>,
+    Json(body): Json<Value>,
+) -> Result<BatchOutcome<Document>, BatchError> {
+    let items = batch_from_body(body).map_err(|e| BatchError::at(0, e))?;
+    run_batch(items, mode, "documents", "created", |doc: NewDocument| {
+        let store = Arc::clone(&state.store);
+        async move { store.create(doc).await.map(|d| vec![d]) }
+    })
+    .await
 }
 
 /// Fetch a document by id.
@@ -378,6 +402,123 @@ async fn record_fact(
 ) -> Result<Json<Value>, ApiError> {
     let stored = state.facts().record(fact).await?;
     Ok(Json(json!(stored)))
+}
+
+/// Record many fact bundles in one request.
+///
+/// Body is an array of [`NewBundle`] — each an entity, one shared authority,
+/// and any number of dimensions observed together. A bare object is accepted
+/// as a batch of one. This is the storage-efficient shape: within a bundle
+/// the entity URN, provenance, and timestamps are written once rather than
+/// once per dimension, which is why the batch takes bundles instead of a flat
+/// list of facts. To record unrelated single facts, send one-dimension
+/// bundles.
+///
+/// By default every bundle is attempted and the failures are reported per
+/// item; add `?on_error=stop` to halt at the first one. An `index` in the
+/// response refers to the input bundle, while the `recorded` count is facts.
+/// See [`run_batch`] for the shared semantics.
+async fn record_facts_batch(
+    State(state): State<AppState>,
+    AxumQuery(mode): AxumQuery<BatchMode>,
+    Json(body): Json<Value>,
+) -> Result<BatchOutcome<Fact>, BatchError> {
+    let items = batch_from_body(body).map_err(|e| BatchError::at(0, e))?;
+    let facts = Arc::new(state.facts());
+    // A bundle explodes into one fact per dimension on the way back, so one
+    // input item can yield several outputs and `recorded` counts facts, not
+    // bundles. An `index` in `errors` still refers to the input bundle.
+    run_batch(items, mode, "facts", "recorded", move |bundle: NewBundle| {
+        let facts = Arc::clone(&facts);
+        async move { facts.record_bundle(bundle).await }
+    })
+    .await
+}
+
+/// How a batch handles an item that fails.
+#[derive(serde::Deserialize, Default, Clone, Copy, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum OnError {
+    /// Attempt every item; collect the failures and report them per item.
+    #[default]
+    Continue,
+    /// Stop at the first failure. Items already written stay written.
+    Stop,
+}
+
+/// The `?on_error=` query parameter. Absent means [`OnError::Continue`].
+#[derive(serde::Deserialize, Default)]
+struct BatchMode {
+    #[serde(default)]
+    on_error: OnError,
+}
+
+/// Deserialize each raw item into `I` and drive it through `write`, one at a
+/// time, in request order.
+///
+/// Parsing happens per item rather than up front, so a malformed item is just
+/// another failed item: in the default [`OnError::Continue`] mode the rest of
+/// the batch still gets written. This matters for imports fed by messy
+/// sources, where one bad row should not reject the other thousand.
+///
+/// Under [`OnError::Continue`] every item is attempted and the failures come
+/// back in the [`BatchOutcome`] (`200` if none failed, `207` if any did).
+/// Under [`OnError::Stop`] the first failure returns a [`BatchError`] naming
+/// its index.
+///
+/// Either way the writes are **not** transactional: items written before a
+/// failure stay written, because the stores expose no transaction spanning
+/// several writes. `write` returns a `Vec` since one input item can produce
+/// more than one stored record (a fact bundle yields one fact per dimension).
+async fn run_batch<I, T, F, Fut>(
+    items: Vec<Value>,
+    mode: BatchMode,
+    written_key: &'static str,
+    count_key: &'static str,
+    write: F,
+) -> Result<BatchOutcome<T>, BatchError>
+where
+    I: serde::de::DeserializeOwned,
+    F: Fn(I) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<T>, dkg_core::Error>>,
+{
+    let mut written = Vec::with_capacity(items.len());
+    let mut errors = Vec::new();
+    for (index, raw) in items.into_iter().enumerate() {
+        let result = match serde_json::from_value::<I>(raw) {
+            Ok(item) => write(item).await,
+            Err(e) => Err(dkg_core::Error::from(e)),
+        };
+        match result {
+            Ok(stored) => written.extend(stored),
+            Err(e) if mode.on_error == OnError::Stop => return Err(BatchError::at(index, e)),
+            Err(e) => errors.push((index, e)),
+        }
+    }
+    Ok(BatchOutcome {
+        written,
+        errors,
+        written_key,
+        count_key,
+    })
+}
+
+/// Split a batch request body into its raw items.
+///
+/// Accepts either a JSON array or a single bare object, which is treated as a
+/// batch of one so callers can use the batch route uniformly. Items stay as
+/// [`Value`] and are deserialized one at a time by [`run_batch`], so a single
+/// malformed item becomes a per-item error instead of rejecting the whole
+/// request — the point of a best-effort import. Only a body that is neither an
+/// array nor an object fails here.
+fn batch_from_body(body: Value) -> Result<Vec<Value>, dkg_core::Error> {
+    match body {
+        Value::Array(items) => Ok(items),
+        obj @ Value::Object(_) => Ok(vec![obj]),
+        _ => Err(dkg_core::Error::Invalid(
+            "expected a JSON object or array of objects".into(),
+        )),
+    }
 }
 
 /// An entity selector: the URN, and an optional dimension to narrow to.
