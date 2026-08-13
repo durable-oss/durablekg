@@ -1,6 +1,6 @@
-# Endpoints (feature C)
+# Endpoints
 
-A feature-C endpoint turns an upstream API into a cached document. Call it, and
+An endpoint turns an upstream API into a cached document. Call it, and
 DurableKG returns a fresh cached result or fetches the upstream, stores the
 result as a document, and returns it.
 
@@ -22,7 +22,7 @@ Mounted at `GET /v1/endpoints/:name`.
 ## Caching
 
 A cached result is fresh while `now - created_at < cache_seconds`. Results are
-stored as feature-A documents in the endpoint's collection (default: the
+stored as documents in the endpoint's collection (default: the
 endpoint name), tagged with the cache key. `cache_seconds: 0` disables caching.
 
 ## Per-request passthrough

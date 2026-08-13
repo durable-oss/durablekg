@@ -8,11 +8,14 @@
 //!
 //! The index is a *derived* structure — Fjall is the source of truth — so a
 //! lost or corrupt index can be rebuilt by re-indexing every record. That
-//! is what [`crate::object::ObjectDocumentStore::repair`] does.
+//! is what [`DocumentStore::repair`] does.
+//!
+//! [`DocumentStore::repair`]: crate::store::DocumentStore::repair
 //!
 //! [Tantivy]: tantivy
 
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use dkg_core::{Error, Result};
@@ -37,6 +40,9 @@ pub struct FullTextIndex {
     index: Index,
     writer: Arc<RwLock<IndexWriter>>,
     reader: IndexReader,
+    /// Changes staged since the last commit. Shared across clones so the
+    /// writer thread sees work staged through any handle.
+    pending: Arc<AtomicUsize>,
     id_field: Field,
     collection_field: Field,
     body_field: Field,
@@ -81,6 +87,7 @@ impl FullTextIndex {
             index,
             writer: Arc::new(RwLock::new(writer)),
             reader,
+            pending: Arc::new(AtomicUsize::new(0)),
             id_field,
             collection_field,
             body_field,
@@ -90,6 +97,13 @@ impl FullTextIndex {
 
     /// Index (or re-index) a document. Existing entries for the same id are
     /// replaced.
+    ///
+    /// The document is staged in the writer's in-memory buffer but **not**
+    /// committed: a Tantivy `commit` writes and fsyncs a segment, which is
+    /// far too expensive to pay per document. [`Self::commit`] makes staged
+    /// work visible to searches, and the pool's writer thread drives it on an
+    /// interval. Until then the document is not searchable, though it is
+    /// already durable in Fjall and fetchable by id.
     ///
     /// # Errors
     ///
@@ -101,7 +115,7 @@ impl FullTextIndex {
         body_text: &str,
         metadata_text: &str,
     ) -> Result<()> {
-        let mut writer = self
+        let writer = self
             .writer
             .write()
             .map_err(|_| Error::storage("index writer lock poisoned"))?;
@@ -115,29 +129,78 @@ impl FullTextIndex {
                 self.metadata_field => metadata_text,
             ))
             .map_err(Error::storage)?;
-        writer.commit().map_err(Error::storage)?;
-        self.reader.reload().map_err(Error::storage)?;
+        drop(writer);
+        self.note_pending();
         Ok(())
     }
 
     /// Remove a document from the index. Removing an absent id is a no-op.
     ///
+    /// Staged like [`Self::index_document`]; the removal becomes visible at
+    /// the next [`Self::commit`].
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Storage`] on failure.
     pub fn remove_document(&self, id: Uuid) -> Result<()> {
-        let mut writer = self
+        let writer = self
             .writer
             .write()
             .map_err(|_| Error::storage("index writer lock poisoned"))?;
         writer.delete_term(Term::from_field_text(self.id_field, &id.to_string()));
+        drop(writer);
+        self.note_pending();
+        Ok(())
+    }
+
+    /// Record one more staged change, for [`Self::pending`].
+    fn note_pending(&self) {
+        self.pending.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many changes are staged but not yet committed.
+    ///
+    /// The writer thread uses this to commit early when a burst of writes
+    /// arrives, rather than letting them sit until the interval elapses.
+    pub fn pending(&self) -> usize {
+        self.pending.load(Ordering::Relaxed)
+    }
+
+    /// Commit staged changes and reload the reader, making every write since
+    /// the last commit visible to [`Self::search`].
+    ///
+    /// A no-op when nothing is staged, so an idle interval tick costs
+    /// nothing. This is the expensive call the write path deliberately
+    /// avoids: amortizing it across a batch is the whole point.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] if the commit or reader reload fails.
+    pub fn commit(&self) -> Result<()> {
+        let mut writer = self
+            .writer
+            .write()
+            .map_err(|_| Error::storage("index writer lock poisoned"))?;
+        // Re-check under the lock: another thread may have committed the
+        // staged work between our read and acquiring the writer.
+        if self.pending.load(Ordering::Relaxed) == 0 {
+            return Ok(());
+        }
         writer.commit().map_err(Error::storage)?;
+        // Clear only what this commit covered. Writes staged while we held
+        // the lock are impossible (the lock is exclusive), so a swap to zero
+        // cannot drop a concurrent increment.
+        self.pending.store(0, Ordering::Relaxed);
+        drop(writer);
         self.reader.reload().map_err(Error::storage)?;
         Ok(())
     }
 
     /// Run a full-text query over body and metadata, returning up to `limit`
     /// hits. A `collection` filter, when set, is ANDed into the query.
+    ///
+    /// Only committed documents are visible; a write staged since the last
+    /// commit will not match. See [`Self::commit`].
     ///
     /// # Errors
     ///
@@ -179,6 +242,25 @@ impl FullTextIndex {
             }
         }
         Ok(hits)
+    }
+}
+
+impl crate::object::worker::GroupCommit for FullTextIndex {
+    fn flush(&self) -> Result<()> {
+        self.commit()
+    }
+
+    /// Tantivy tracks its own staged count, which is the accurate one: it
+    /// counts documents actually added, not jobs the pool happened to run
+    /// (a read-only job stages nothing).
+    fn should_flush(
+        &self,
+        _staged: usize,
+        elapsed: std::time::Duration,
+        config: &crate::object::worker::CommitConfig,
+    ) -> bool {
+        let pending = self.pending();
+        pending > 0 && (pending >= config.max_staged || elapsed >= config.interval)
     }
 }
 

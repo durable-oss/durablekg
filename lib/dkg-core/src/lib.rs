@@ -28,7 +28,7 @@ pub mod config;
 pub mod error;
 pub mod registry;
 
-pub use config::Settings;
+pub use config::{BindAddress, Settings};
 pub use error::{Error, Result};
 pub use registry::{find, names, Named};
 

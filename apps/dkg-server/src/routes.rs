@@ -5,14 +5,15 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query as AxumQuery, RawQuery, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use dkg_config::Endpoint;
 use dkg_documents::{Document, DocumentStore, NewDocument, Query, Urn};
 use dkg_endpoints::{CallRequest, EnvSecrets, HttpFetcher};
-use dkg_entity_fact_resolver::{resolve_entity, sync_entity};
+use dkg_entity_fact_resolver::{resolve_entity, sync_entity, SyncQueue};
 use dkg_facts::{DocumentFactStore, Fact, FactStore, NewBundle, NewFact};
 use dkg_graph::{Filter, GraphStore, Op, OrderBy, Record, Schema, SortDirection};
 use serde_json::{json, Value};
@@ -56,6 +57,10 @@ pub struct AppState {
     /// The fixed API key inbound requests must present, or `None` to accept
     /// every request unauthenticated (see [`crate::auth`]).
     pub api_key: Option<Arc<str>>,
+    /// Entities whose facts changed and whose overview rows a background task
+    /// will rebuild. `None` when feature B is not configured (with no graph
+    /// there is nothing to sync into) or when background sync is disabled.
+    pub sync_queue: Option<SyncQueue>,
 }
 
 impl AppState {
@@ -73,6 +78,19 @@ impl AppState {
     /// A, so this needs no extra state — just a typed view of `store`.
     fn facts(&self) -> DocumentFactStore {
         DocumentFactStore::new(Arc::clone(&self.store))
+    }
+
+    /// Queue `entities` for a background overview rebuild.
+    ///
+    /// Recording a fact and rebuilding the entity's overview row are two
+    /// halves of one operation; doing the second here means callers do not
+    /// have to track what they touched and issue a second request. A no-op
+    /// when background sync is off, in which case a caller drives
+    /// `/v1/facts/sync` itself.
+    fn queue_sync(&self, entities: impl IntoIterator<Item = Urn>) {
+        if let Some(queue) = &self.sync_queue {
+            queue.mark_all_dirty(entities);
+        }
     }
 }
 
@@ -106,6 +124,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/facts/batch", post(record_facts_batch))
         .route("/v1/facts/resolve", post(resolve_facts))
         .route("/v1/facts/sync", post(sync_facts))
+        .route("/v1/facts/sync/batch", post(sync_facts_batch))
+        .route("/v1/facts/sync/all", post(sync_all))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_api_key,
@@ -401,6 +421,8 @@ async fn record_fact(
     Json(fact): Json<NewFact>,
 ) -> Result<Json<Value>, ApiError> {
     let stored = state.facts().record(fact).await?;
+    // The entity's overview row is now stale; a background pass rebuilds it.
+    state.queue_sync([stored.entity.clone()]);
     Ok(Json(json!(stored)))
 }
 
@@ -428,11 +450,17 @@ async fn record_facts_batch(
     // A bundle explodes into one fact per dimension on the way back, so one
     // input item can yield several outputs and `recorded` counts facts, not
     // bundles. An `index` in `errors` still refers to the input bundle.
-    run_batch(items, mode, "facts", "recorded", move |bundle: NewBundle| {
+    let outcome = run_batch(items, mode, "facts", "recorded", move |bundle: NewBundle| {
         let facts = Arc::clone(&facts);
         async move { facts.record_bundle(bundle).await }
     })
-    .await
+    .await?;
+
+    // Queue every entity the batch touched. The dirty set deduplicates, so a
+    // bundle's several facts — and repeat writes to one entity — collapse
+    // into a single background sync.
+    state.queue_sync(outcome.written.iter().map(|f| f.entity.clone()));
+    Ok(outcome)
 }
 
 /// How a batch handles an item that fails.
@@ -565,6 +593,10 @@ async fn resolve_facts(
 
 /// Resolve an entity's facts and write the overview row into its graph table.
 /// Re-syncing replaces the row. Requires feature B.
+///
+/// Recording facts already queues their entities for a background sync, so
+/// this is the "don't wait for it" path: call it when you need the overview
+/// row visible now rather than within the sync interval.
 async fn sync_facts(
     State(state): State<AppState>,
     Json(req): Json<EntityRef>,
@@ -579,6 +611,156 @@ async fn sync_facts(
         "fact_count": outcome.fact_count,
         "record": outcome.record,
     })))
+}
+
+/// Resolve and sync many entities in one request.
+///
+/// Body is an array of [`EntityRef`] (a bare object is accepted as a batch of
+/// one), matching the other batch routes. This is the path bulk importers
+/// should use: where `/v1/facts/sync` costs an alias lookup per alias plus a
+/// single-row `INSERT` for each entity, a batch collapses those into one
+/// alias query and one multi-row `INSERT` per target table, and reads the
+/// entities' facts concurrently.
+///
+/// Every entity is attempted regardless of `?on_error=`; failures are
+/// reported per item, with `index` referring to the input entity. That
+/// differs from the other batch routes on purpose: the writes are grouped, so
+/// there is no meaningful point at which to "stop at the first failure" —
+/// entities are not written strictly in request order.
+///
+/// Returns `200` when every entity synced, `207` when some failed.
+async fn sync_facts_batch(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<BatchOutcome<Value>, BatchError> {
+    let items = batch_from_body(body).map_err(|e| BatchError::at(0, e))?;
+
+    // Parse every item first: a malformed entry becomes a per-item error
+    // rather than rejecting the batch, matching `run_batch`.
+    let mut entities = Vec::with_capacity(items.len());
+    let mut errors: Vec<(usize, dkg_core::Error)> = Vec::new();
+    for (index, raw) in items.into_iter().enumerate() {
+        match serde_json::from_value::<EntityRef>(raw) {
+            Ok(item) => entities.push((index, item.entity)),
+            Err(e) => errors.push((index, dkg_core::Error::from(e))),
+        }
+    }
+
+    // A missing feature-B config is a whole-request failure, not a per-item
+    // one: no entity in the batch could sync without it.
+    let graph = state.graph().map_err(|ApiError(e)| BatchError::at(0, e))?;
+    let facts = state.facts();
+
+    let urns: Vec<Urn> = entities.iter().map(|(_, urn)| urn.clone()).collect();
+    let results =
+        dkg_entity_fact_resolver::sync_entities(&facts, graph.store.as_ref(), &graph.schema, &urns)
+            .await;
+
+    let mut written = Vec::new();
+    for ((index, urn), result) in entities.into_iter().zip(results) {
+        match result {
+            Ok(outcome) => written.push(json!({
+                "entity": urn.to_string(),
+                "table": urn.namespace(),
+                "id": outcome.id,
+                "fact_count": outcome.fact_count,
+                "record": outcome.record,
+            })),
+            Err(e) => errors.push((index, e)),
+        }
+    }
+
+    // Parse failures were collected before the sync, so sort by input index
+    // to keep `errors` in request order.
+    errors.sort_by_key(|(index, _)| *index);
+
+    Ok(BatchOutcome {
+        written,
+        errors,
+        written_key: "entities",
+        count_key: "synced",
+    })
+}
+
+/// Which tables a sync-all request covers.
+#[derive(serde::Deserialize, Default)]
+struct SyncAllRequest {
+    /// Tables to sync. Omit (or send an empty list) to sync every table in
+    /// the loaded schema.
+    #[serde(default)]
+    tables: Vec<String>,
+}
+
+/// Rebuild the overview rows for every entity that has facts, table by table.
+///
+/// This is the reconciliation path, not the hot path: it enumerates each
+/// table's fact collection and re-syncs everything in it, in parallel chunks.
+/// Reach for it after a bulk fact import that skipped syncing, or to repair
+/// rows that drifted.
+///
+/// Body is optional; `{"tables": ["businesses"]}` limits the run, and an
+/// absent or empty list covers every table in the schema.
+///
+/// Per-entity failures are reported per table rather than aborting the run, so
+/// one bad entity cannot stop a full rebuild. Returns `200` when everything
+/// synced and `207` when any entity failed.
+///
+/// The request holds until the sync finishes, which for a large table is a
+/// long time. It is deliberately synchronous: a caller running a repair wants
+/// to know the outcome, and the background sync queue already covers the
+/// fire-and-forget case.
+async fn sync_all(
+    State(state): State<AppState>,
+    body: Option<Json<SyncAllRequest>>,
+) -> Result<Response, ApiError> {
+    let req = body.map(|Json(r)| r).unwrap_or_default();
+    let graph = state.graph()?;
+    let facts = state.facts();
+
+    let tables: Vec<String> = if req.tables.is_empty() {
+        graph.schema.tables().map(|t| t.name.clone()).collect()
+    } else {
+        req.tables
+    };
+
+    let mut summaries = Vec::with_capacity(tables.len());
+    let mut synced = 0usize;
+    let mut failed = 0usize;
+
+    for table in tables {
+        let summary =
+            dkg_entity_fact_resolver::sync_table(&facts, graph.store.as_ref(), &graph.schema, &table)
+                .await?;
+        synced += summary.synced;
+        failed += summary.failures.len();
+        summaries.push(json!({
+            "table": summary.table,
+            "synced": summary.synced,
+            "failed": summary.failures.len(),
+            "errors": summary
+                .failures
+                .iter()
+                .map(|(entity, error)| json!({ "entity": entity, "error": error }))
+                .collect::<Vec<_>>(),
+        }));
+    }
+
+    // A partial rebuild still ran; 207 lets a caller detect failures without
+    // parsing the body, matching the other batch routes.
+    let status = if failed == 0 {
+        StatusCode::OK
+    } else {
+        StatusCode::MULTI_STATUS
+    };
+    Ok((
+        status,
+        Json(json!({
+            "synced": synced,
+            "failed": failed,
+            "tables": summaries,
+        })),
+    )
+        .into_response())
 }
 
 // ---- Feature C: caching endpoints -----------------------------------------

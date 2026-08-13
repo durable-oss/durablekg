@@ -45,7 +45,7 @@ use dkg_core::registry::Named;
 use dkg_core::{Error, Result};
 use serde_json::Value;
 
-pub use clickhouse::ClickHouseStore;
+pub use clickhouse::{ClickHouseStore, UpsertItem};
 pub use dml::{Filter, Op, OrderBy, Record, SortDirection};
 pub use schema::Schema;
 
@@ -132,6 +132,81 @@ pub trait GraphStore: Send + Sync {
         alias_value: &str,
     ) -> Result<Option<String>>;
 
+    /// Every `(alias_type, alias_value)` registered for `entity_id` — the
+    /// reverse of [`resolve_alias`](Self::resolve_alias).
+    ///
+    /// Facts are indexed under the exact entity URN they were recorded with,
+    /// so an entity known by several aliases has its facts split across
+    /// several keys. The sync path uses this to gather all of them.
+    ///
+    /// The default implementation returns nothing, which degrades to
+    /// single-alias behaviour rather than failing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error.
+    async fn aliases_for_entity(
+        &self,
+        _schema: &Schema,
+        _table: &str,
+        _entity_id: &str,
+    ) -> Result<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
+
+    /// Resolve many `(alias_type, alias_value)` pairs at once, returning a map
+    /// from pair to the `entity_id` it points at. Pairs with no mapping are
+    /// absent from the map.
+    ///
+    /// The bulk form of [`resolve_alias`](Self::resolve_alias): one round trip
+    /// for a whole batch instead of one per alias. The default implementation
+    /// loops, so a backend without a bulk path stays correct.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table is unknown or the backend read fails.
+    async fn resolve_aliases(
+        &self,
+        schema: &Schema,
+        table: &str,
+        aliases: &[(String, String)],
+    ) -> Result<std::collections::HashMap<(String, String), String>> {
+        let mut out = std::collections::HashMap::new();
+        for alias in aliases {
+            if let Some(id) = self.resolve_alias(schema, table, &alias.0, &alias.1).await? {
+                out.insert(alias.clone(), id);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every `(alias_type, alias_value)` registered for each of `entity_ids`,
+    /// keyed by entity id — the bulk form of
+    /// [`aliases_for_entity`](Self::aliases_for_entity).
+    ///
+    /// Entity ids with no registered aliases are absent from the map. The
+    /// default implementation loops, so a backend without a bulk path stays
+    /// correct.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error.
+    async fn aliases_for_entities(
+        &self,
+        schema: &Schema,
+        table: &str,
+        entity_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<(String, String)>>> {
+        let mut out = std::collections::HashMap::new();
+        for id in entity_ids {
+            let aliases = self.aliases_for_entity(schema, table, id).await?;
+            if !aliases.is_empty() {
+                out.insert(id.clone(), aliases);
+            }
+        }
+        Ok(out)
+    }
+
     /// Upsert a record into `table` keyed by its aliases, returning the system
     /// `id` it was written under.
     ///
@@ -171,6 +246,48 @@ pub trait GraphStore: Send + Sync {
         id: &str,
         aliases: &[(String, String)],
     ) -> Result<String>;
+
+    /// Upsert many entities into one `table` in a single pass, returning the
+    /// system `id` written for each, in input order.
+    ///
+    /// A backend that can batch should collapse the per-entity round trips
+    /// (an alias lookup per alias, plus a single-row insert) into a handful of
+    /// statements for the whole set. The default implementation simply loops
+    /// over the per-entity methods, so a backend that cannot batch stays
+    /// correct without extra code.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error, or [`Error::Invalid`] on a bad record, an
+    /// unparseable supplied id, or an alias merge conflict.
+    async fn upsert_batch(
+        &self,
+        schema: &Schema,
+        table: &str,
+        items: &[UpsertItem],
+    ) -> Result<Vec<String>> {
+        let mut ids = Vec::with_capacity(items.len());
+        for item in items {
+            let id = match &item.id {
+                Some(id) => {
+                    self.upsert_by_aliases_with_id(
+                        schema,
+                        table,
+                        &item.record,
+                        id,
+                        &item.aliases,
+                    )
+                    .await?
+                }
+                None => {
+                    self.upsert_by_aliases(schema, table, &item.record, &item.aliases)
+                        .await?
+                }
+            };
+            ids.push(id);
+        }
+        Ok(ids)
+    }
 }
 
 #[async_trait]
@@ -220,6 +337,33 @@ impl GraphStore for ClickHouseStore {
         ClickHouseStore::resolve_alias(self, schema, table, alias_type, alias_value).await
     }
 
+    async fn aliases_for_entity(
+        &self,
+        schema: &Schema,
+        table: &str,
+        entity_id: &str,
+    ) -> Result<Vec<(String, String)>> {
+        ClickHouseStore::aliases_for_entity(self, schema, table, entity_id).await
+    }
+
+    async fn resolve_aliases(
+        &self,
+        schema: &Schema,
+        table: &str,
+        aliases: &[(String, String)],
+    ) -> Result<std::collections::HashMap<(String, String), String>> {
+        ClickHouseStore::resolve_aliases(self, schema, table, aliases).await
+    }
+
+    async fn aliases_for_entities(
+        &self,
+        schema: &Schema,
+        table: &str,
+        entity_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<(String, String)>>> {
+        ClickHouseStore::aliases_for_entities(self, schema, table, entity_ids).await
+    }
+
     async fn upsert_by_aliases(
         &self,
         schema: &Schema,
@@ -228,6 +372,15 @@ impl GraphStore for ClickHouseStore {
         aliases: &[(String, String)],
     ) -> Result<String> {
         ClickHouseStore::upsert_by_aliases(self, schema, table, record, aliases).await
+    }
+
+    async fn upsert_batch(
+        &self,
+        schema: &Schema,
+        table: &str,
+        items: &[UpsertItem],
+    ) -> Result<Vec<String>> {
+        ClickHouseStore::upsert_batch(self, schema, table, items).await
     }
 
     async fn upsert_by_aliases_with_id(

@@ -17,35 +17,35 @@ README](../README.md).
                     │ rides on        │ dkg-entity-fact-resolver  │
                     ▼                 │ ResolvedEntity → Record   │
         ┌───────────────────────┐     └───────────┬───────────────┘
-        │  A — Documents        │                 │ sync (write the overview row)
+        │  Documents            │                 │ sync (write the overview row)
         │  dkg-documents        │                 ▼
         │  OpenDAL+Fjall+Tantivy│     ┌───────────────────────────┐
-        └───────────────────────┘     │ B — Relational records    │
+        └───────────────────────┘     │ Relational records        │
                     ▲                 │ dkg-graph (ClickHouse)    │
         ┌───────────┴───────────┐     │ ReplacingMergeTree rows   │
-        │  C — Endpoints        │     └───────────────────────────┘
+        │  Endpoints            │     └───────────────────────────┘
         │  cache upstreams as   │
-        │  documents            │     D — Jobs: bulk A → B transforms
+        │  documents            │     Jobs: bulk document → record transforms
         └───────────────────────┘
 ```
 
-- **Documents (A)** are the substrate. Facts and cached endpoint results are
+- **Documents** are the substrate. Facts and cached endpoint results are
   both stored as documents.
-- **Relational records (B)** are the queryable, typed shape — the *target* an
+- **Relational records** are the queryable, typed shape — the *target* an
   entity's facts resolve into.
-- **Endpoints (C)** turn upstream APIs into cached documents.
-- **Jobs (D)** bulk-transform documents into records.
-- **Facts** sit between A and B: claims land as documents, resolve into one
-  overview per entity, and sync into a B table.
+- **Endpoints** turn upstream APIs into cached documents.
+- **Jobs** bulk-transform documents into records.
+- **Facts** sit between documents and relational records: claims land as documents, resolve into one
+  overview per entity, and sync into a relational table.
 
 ## Pages
 
 | Page | What it covers |
 | ---- | -------------- |
-| [Documents (A)](documents.md) | The document store, URNs, search, durability |
-| [Relational records (B)](relational.md) | Tables, relationships, reconcile, ReplacingMergeTree |
-| [Endpoints (C)](endpoints.md) | Caching API endpoints, forwarding, upstream auth |
-| [Jobs (D)](jobs.md) | Document → record bulk transforms |
+| [Documents](documents.md) | The document store, URNs, search, durability |
+| [Relational records](relational.md) | Tables, relationships, reconcile, ReplacingMergeTree |
+| [Endpoints](endpoints.md) | Caching API endpoints, forwarding, upstream auth |
+| [Jobs](jobs.md) | Document → record bulk transforms |
 | [Facts & overview resolution](facts.md) | Fact storage, authority resolution, sync |
 | [Configuration reference](configuration.md) | Env vars, Trongoscript config kinds |
 

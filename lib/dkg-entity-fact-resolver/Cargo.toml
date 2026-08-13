@@ -17,8 +17,17 @@ dkg-config.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 inventory.workspace = true
+futures.workspace = true
+tokio = { workspace = true }
+tracing.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+tokio = { workspace = true }
+async-trait = "0.1"
+# The read-cost tests drive the real document-backed fact store, so they need
+# the object store and a temp directory to put it in.
+dkg-documents.workspace = true
+tempfile = "3"

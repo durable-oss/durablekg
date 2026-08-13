@@ -30,15 +30,83 @@
 
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use async_channel::{Receiver, Sender};
+use async_channel::{Receiver, Sender, TryRecvError};
 use dkg_core::{Error, Result};
 use tokio::sync::oneshot;
+
+/// How long the writer parks when it has staged work but an empty queue.
+///
+/// Short enough that the flush deadline stays accurate to roughly this
+/// granularity, long enough that waiting out a two-second interval costs a
+/// trivial number of wakeups.
+const IDLE_POLL: Duration = Duration::from_millis(5);
+
+/// Run a group flush and reset the staging counters.
+///
+/// A failed flush leaves the data staged but un-durable; the counters reset
+/// regardless, because retrying the same flush on the next tick will not fix
+/// a persistent I/O error and a stuck counter would flush on every subsequent
+/// job. The error surfaces to the caller of the *next* write through the
+/// store's own error path.
+fn flush<R: GroupCommit>(resource: &R, staged: &mut usize, last_flush: &mut Instant) {
+    // The result is intentionally swallowed here: this runs on the writer
+    // thread, detached from any one caller's request.
+    let _ = resource.flush();
+    *staged = 0;
+    *last_flush = Instant::now();
+}
 
 /// A unit of work: run a closure against the worker's resource and send the
 /// result back. Boxed so jobs of different return types share one queue.
 type Job<R> = Box<dyn FnOnce(&R) + Send + 'static>;
+
+/// A resource whose writes are made durable (or visible) in *groups* rather
+/// than one at a time.
+///
+/// Both backing stores pay a large fixed cost per durability barrier — an
+/// fsync for Fjall, a segment commit for Tantivy — so both stage writes and
+/// flush them together. The writer thread calls [`flush`](GroupCommit::flush)
+/// on an interval, once a write has been staged, and again at shutdown.
+///
+/// The default implementation makes this a no-op, so a resource with no
+/// group-commit semantics needs no extra code.
+pub trait GroupCommit {
+    /// Flush staged writes. Called from the writer thread only, never
+    /// concurrently with itself.
+    fn flush(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Whether a flush is worth doing right now, given how long it has been
+    /// since the last one. Lets a resource commit early under a burst
+    /// instead of waiting out the interval.
+    ///
+    /// `staged` is how many writes the pool has run since its last flush.
+    fn should_flush(&self, staged: usize, elapsed: Duration, config: &CommitConfig) -> bool {
+        staged > 0 && (staged >= config.max_staged || elapsed >= config.interval)
+    }
+}
+
+/// Tuning for the writer thread's group commit.
+#[derive(Debug, Clone, Copy)]
+pub struct CommitConfig {
+    /// Longest a staged write waits before being flushed.
+    pub interval: Duration,
+    /// Flush early once this many writes are staged, so a burst does not sit
+    /// buffered for the whole interval.
+    pub max_staged: usize,
+}
+
+impl Default for CommitConfig {
+    fn default() -> Self {
+        CommitConfig {
+            interval: Duration::from_secs(2),
+            max_staged: 1000,
+        }
+    }
+}
 
 /// Tuning for a [`WorkerPool`].
 #[derive(Debug, Clone, Copy)]
@@ -50,6 +118,23 @@ pub struct PoolConfig {
     /// How long [`WorkerPool::read`] / [`WorkerPool::write`] wait for a free
     /// queue slot before returning [`Error::Overloaded`].
     pub enqueue_timeout: Duration,
+    /// How long a submitted job may take to come back before the caller gives
+    /// up with [`Error::Overloaded`]. `None` waits indefinitely.
+    ///
+    /// The enqueue timeout alone does not bound a request: with a deep queue
+    /// there is nearly always a free slot, so submission succeeds instantly
+    /// and the caller then blocks on the reply for as long as the job runs.
+    /// A job that is slow — or a pool whose threads are all busy with slow
+    /// jobs — therefore produces an unbounded hang rather than a fast,
+    /// retryable failure. This is the ceiling that turns that into a `503`.
+    ///
+    /// It bounds the *caller*, not the worker: the job keeps running to
+    /// completion on its thread, since interrupting a blocking store call
+    /// midway is not something the pool can do safely. So this converts an
+    /// invisible hang into a visible error; it does not free the thread.
+    pub execute_timeout: Option<Duration>,
+    /// Group-commit tuning for the writer thread.
+    pub commit: CommitConfig,
 }
 
 impl Default for PoolConfig {
@@ -58,6 +143,13 @@ impl Default for PoolConfig {
             readers: 4,
             queue_depth: 1024,
             enqueue_timeout: Duration::from_millis(250),
+            // Generous on purpose. This is a backstop against a hung request,
+            // not a latency target: a healthy read answers in milliseconds,
+            // while a legitimately slow one (a large collection scan, an
+            // index backfill) can take seconds. Set it low enough to cut real
+            // work and it becomes a source of spurious 503s.
+            execute_timeout: Some(Duration::from_secs(30)),
+            commit: CommitConfig::default(),
         }
     }
 }
@@ -70,6 +162,13 @@ impl PoolConfig {
     /// - `DKG_STORE_QUEUE_DEPTH` — bounded queue capacity per queue
     /// - `DKG_STORE_ENQUEUE_TIMEOUT_MS` — backpressure wait before
     ///   [`Error::Overloaded`]
+    /// - `DKG_STORE_EXECUTE_TIMEOUT_MS` — how long a submitted job may run
+    ///   before the caller gives up; `0` disables the ceiling and waits
+    ///   indefinitely
+    /// - `DKG_STORE_COMMIT_INTERVAL_MS` — longest a staged write waits before
+    ///   the writer thread flushes it
+    /// - `DKG_STORE_COMMIT_MAX_STAGED` — flush early once this many writes
+    ///   are staged
     ///
     /// Unparseable values are ignored in favour of the default, so a typo
     /// degrades to sane behaviour rather than a boot failure.
@@ -83,6 +182,21 @@ impl PoolConfig {
             enqueue_timeout: env_parse("DKG_STORE_ENQUEUE_TIMEOUT_MS")
                 .map(Duration::from_millis)
                 .unwrap_or(d.enqueue_timeout),
+            // `0` is the explicit opt-out: an operator who would rather wait
+            // than see a 503 can restore the previous unbounded behaviour.
+            execute_timeout: match env_parse::<u64>("DKG_STORE_EXECUTE_TIMEOUT_MS") {
+                Some(0) => None,
+                Some(ms) => Some(Duration::from_millis(ms)),
+                None => d.execute_timeout,
+            },
+            commit: CommitConfig {
+                interval: env_parse("DKG_STORE_COMMIT_INTERVAL_MS")
+                    .map(Duration::from_millis)
+                    .unwrap_or(d.commit.interval),
+                max_staged: env_parse("DKG_STORE_COMMIT_MAX_STAGED")
+                    .unwrap_or(d.commit.max_staged)
+                    .max(1),
+            },
         }
     }
 }
@@ -103,6 +217,7 @@ pub struct WorkerPool<R: Send + 'static> {
     write_tx: Sender<Job<R>>,
     read_tx: Sender<Job<R>>,
     enqueue_timeout: Duration,
+    execute_timeout: Option<Duration>,
     label: &'static str,
     /// Join handles for every spawned thread, shared across clones. Taken
     /// (via `Option::take`) by the first caller of [`shutdown`], so threads
@@ -110,7 +225,7 @@ pub struct WorkerPool<R: Send + 'static> {
     handles: Arc<Mutex<Option<Vec<JoinHandle<()>>>>>,
 }
 
-impl<R: Clone + Send + 'static> WorkerPool<R> {
+impl<R: Clone + Send + GroupCommit + 'static> WorkerPool<R> {
     /// Spawn the writer and reader threads over clones of `resource`.
     ///
     /// `label` names the subsystem (e.g. `"meta"` / `"fulltext"`) and is used
@@ -125,17 +240,63 @@ impl<R: Clone + Send + 'static> WorkerPool<R> {
 
         let mut handles = Vec::with_capacity(config.readers.max(1) + 1);
 
-        // Writer: one thread, draining the write queue in order. When the
-        // channel closes it drains the remaining queued jobs and then exits.
+        // Writer: one thread, draining the write queue in order and flushing
+        // staged work in groups. When the channel closes it drains the
+        // remaining queued jobs, flushes a final time, and exits — so an
+        // orderly shutdown never loses a write.
         {
             let resource = resource.clone();
             let write_rx: Receiver<Job<R>> = write_rx;
+            let commit = config.commit;
             handles.push(
                 thread::Builder::new()
                     .name(format!("dkg-{label}-writer"))
                     .spawn(move || {
-                        while let Ok(job) = write_rx.recv_blocking() {
+                        let mut staged = 0usize;
+                        let mut last_flush = Instant::now();
+
+                        loop {
+                            let job = if staged == 0 {
+                                // Nothing staged: no deadline to honour, so
+                                // block until work arrives rather than spin.
+                                match write_rx.recv_blocking() {
+                                    Ok(job) => job,
+                                    Err(_) => break,
+                                }
+                            } else {
+                                // Staged work is waiting on a flush deadline,
+                                // so the wait has to be bounded. Poll, and
+                                // park briefly when the queue is empty.
+                                match write_rx.try_recv() {
+                                    Ok(job) => job,
+                                    Err(TryRecvError::Empty) => {
+                                        if resource.should_flush(
+                                            staged,
+                                            last_flush.elapsed(),
+                                            &commit,
+                                        ) {
+                                            flush(&resource, &mut staged, &mut last_flush);
+                                        } else {
+                                            thread::sleep(IDLE_POLL);
+                                        }
+                                        continue;
+                                    }
+                                    Err(TryRecvError::Closed) => break,
+                                }
+                            };
+
                             job(&resource);
+                            staged += 1;
+
+                            if resource.should_flush(staged, last_flush.elapsed(), &commit) {
+                                flush(&resource, &mut staged, &mut last_flush);
+                            }
+                        }
+
+                        // The queue is closed and drained. Flush whatever is
+                        // still staged so an orderly shutdown loses nothing.
+                        if staged > 0 {
+                            flush(&resource, &mut staged, &mut last_flush);
                         }
                     })
                     .expect("spawn writer thread"),
@@ -162,6 +323,7 @@ impl<R: Clone + Send + 'static> WorkerPool<R> {
             write_tx,
             read_tx,
             enqueue_timeout: config.enqueue_timeout,
+            execute_timeout: config.execute_timeout,
             label,
             handles: Arc::new(Mutex::new(Some(handles))),
         }
@@ -225,7 +387,40 @@ impl<R: Clone + Send + 'static> WorkerPool<R> {
         self.submit(&self.write_tx, "write", f).await
     }
 
+    /// Like [`write`](Self::write), but exempt from the execution ceiling.
+    ///
+    /// For maintenance that is legitimately long-running — an index backfill
+    /// over a whole collection, a repair pass — where the ceiling exists to
+    /// bound a *request* and would otherwise abort real work partway through.
+    /// The enqueue timeout still applies, so this cannot bypass backpressure.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Overloaded`] if the write queue stays full past the
+    /// configured timeout; otherwise whatever `f` returns.
+    pub async fn write_unbounded<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&R) -> Result<T> + Send + 'static,
+    {
+        self.submit_with(&self.write_tx, "write", None, f).await
+    }
+
     async fn submit<T, F>(&self, tx: &Sender<Job<R>>, kind: &str, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&R) -> Result<T> + Send + 'static,
+    {
+        self.submit_with(tx, kind, self.execute_timeout, f).await
+    }
+
+    async fn submit_with<T, F>(
+        &self,
+        tx: &Sender<Job<R>>,
+        kind: &str,
+        execute_timeout: Option<Duration>,
+        f: F,
+    ) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce(&R) -> Result<T> + Send + 'static,
@@ -257,9 +452,23 @@ impl<R: Clone + Send + 'static> WorkerPool<R> {
         }
 
         // Await the worker's reply. A dropped reply channel means the worker
-        // panicked mid-job.
-        reply_rx
-            .await
+        // panicked mid-job. The wait is bounded so a slow or wedged job
+        // surfaces as a retryable `503` instead of an open-ended hang; the
+        // job itself still runs to completion on its thread.
+        let reply = match execute_timeout {
+            Some(limit) => match tokio::time::timeout(limit, reply_rx).await {
+                Ok(reply) => reply,
+                Err(_) => {
+                    return Err(Error::Overloaded(format!(
+                        "{} {kind} job exceeded {limit:?}",
+                        self.label
+                    )))
+                }
+            },
+            None => reply_rx.await,
+        };
+
+        reply
             .map_err(|_| Error::storage(format!("{} {kind} worker dropped the job", self.label)))?
     }
 }
@@ -287,15 +496,38 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    /// A trivial shareable resource: a counter the jobs increment.
+    /// A trivial shareable resource: a counter the jobs increment. Its
+    /// second counter records how many times the pool group-flushed it.
     #[derive(Clone)]
-    struct Counter(Arc<AtomicUsize>);
+    struct Counter(Arc<AtomicUsize>, Arc<AtomicUsize>);
+
+    impl Counter {
+        fn new() -> Self {
+            Counter(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)))
+        }
+
+        fn with_value(value: Arc<AtomicUsize>) -> Self {
+            Counter(value, Arc::new(AtomicUsize::new(0)))
+        }
+
+        /// How many group flushes the writer thread has run.
+        fn flushes(&self) -> usize {
+            self.1.load(Ordering::SeqCst)
+        }
+    }
+
+    impl GroupCommit for Counter {
+        fn flush(&self) -> Result<()> {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
 
     #[tokio::test]
     async fn read_and_write_round_trip() {
         let pool = WorkerPool::spawn(
             "test",
-            Counter(Arc::new(AtomicUsize::new(0))),
+            Counter::new(),
             PoolConfig::default(),
         );
         pool.write(|c| {
@@ -309,15 +541,110 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn many_writes_share_one_group_flush() {
+        // A long interval and a high staged threshold mean nothing flushes
+        // mid-run; the only flush is the one at shutdown. This is the
+        // property the whole design rests on: N writes cost one barrier, not
+        // N of them.
+        let resource = Counter::new();
+        let pool = WorkerPool::spawn(
+            "test",
+            resource.clone(),
+            PoolConfig {
+                readers: 1,
+                queue_depth: 256,
+                enqueue_timeout: Duration::from_secs(5),
+                execute_timeout: None,
+                commit: CommitConfig {
+                    interval: Duration::from_secs(3600),
+                    max_staged: 10_000,
+                },
+            },
+        );
+
+        for _ in 0..100 {
+            pool.write(|c| {
+                c.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+
+        // Nothing has flushed yet: neither trigger has fired.
+        assert_eq!(resource.flushes(), 0, "no flush should have fired yet");
+
+        let drain = pool.clone();
+        tokio::task::spawn_blocking(move || drain.shutdown())
+            .await
+            .unwrap();
+
+        assert_eq!(resource.0.load(Ordering::SeqCst), 100, "every write ran");
+        assert_eq!(
+            resource.flushes(),
+            1,
+            "100 writes should cost exactly one group flush"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_burst_flushes_early_on_the_staged_threshold() {
+        // With a long interval but a low staged threshold, a burst commits on
+        // volume rather than sitting buffered until the interval elapses.
+        let resource = Counter::new();
+        let pool = WorkerPool::spawn(
+            "test",
+            resource.clone(),
+            PoolConfig {
+                readers: 1,
+                queue_depth: 256,
+                enqueue_timeout: Duration::from_secs(5),
+                execute_timeout: None,
+                commit: CommitConfig {
+                    interval: Duration::from_secs(3600),
+                    max_staged: 10,
+                },
+            },
+        );
+
+        // Submit all 30 without awaiting between them, so they are genuinely
+        // queued together. Awaiting each in turn would let the writer drain to
+        // an empty queue between writes and flush from the idle branch at
+        // whatever staged count it happened to hold — which is scheduling
+        // dependent, and is what made an exact-count assertion flaky here.
+        let mut inflight = Vec::with_capacity(30);
+        for _ in 0..30 {
+            let pool = pool.clone();
+            inflight.push(tokio::spawn(async move { pool.write(|_| Ok(())).await }));
+        }
+        for handle in inflight {
+            handle.await.unwrap().unwrap();
+        }
+
+        // The interval is an hour, so every flush came from the staged count.
+        // 30 writes at a threshold of 10 is three groups. A writer that found
+        // its queue briefly empty may have flushed a partial group early, so
+        // allow more than three — but never one per write, which would mean
+        // the burst was not being grouped at all.
+        let flushes = resource.flushes();
+        assert!(
+            (3..30).contains(&flushes),
+            "flushed {flushes} times for 30 writes at a staged threshold of 10"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_drains_queued_jobs_then_rejects() {
         let counter = Arc::new(AtomicUsize::new(0));
         let pool = WorkerPool::spawn(
             "test",
-            Counter(Arc::clone(&counter)),
+            Counter::with_value(Arc::clone(&counter)),
             PoolConfig {
                 readers: 1,
                 queue_depth: 16,
                 enqueue_timeout: Duration::from_secs(5),
+                execute_timeout: None,
+                commit: CommitConfig::default(),
             },
         );
 
@@ -373,11 +700,13 @@ mod tests {
         // serialized this would take ~400ms; concurrently it's ~100ms.
         let pool = WorkerPool::spawn(
             "test",
-            Counter(Arc::new(AtomicUsize::new(0))),
+            Counter::new(),
             PoolConfig {
                 readers: 4,
                 queue_depth: 16,
                 enqueue_timeout: Duration::from_secs(5),
+                execute_timeout: None,
+                commit: CommitConfig::default(),
             },
         );
 
@@ -404,6 +733,71 @@ mod tests {
         );
     }
 
+    /// A slow job must fail the caller rather than hang it.
+    ///
+    /// The enqueue timeout does not cover this: with a free queue slot the
+    /// submission succeeds instantly, and without an execution ceiling the
+    /// caller then waits for however long the job takes. That is what turned
+    /// an expensive read into a request that never returned instead of a
+    /// fast, retryable `503`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_job_times_out_instead_of_hanging() {
+        let pool = WorkerPool::spawn(
+            "test",
+            Counter::new(),
+            PoolConfig {
+                readers: 1,
+                queue_depth: 16,
+                enqueue_timeout: Duration::from_secs(5),
+                execute_timeout: Some(Duration::from_millis(100)),
+                commit: CommitConfig::default(),
+            },
+        );
+
+        let start = std::time::Instant::now();
+        let result = pool
+            .read(|_| {
+                std::thread::sleep(Duration::from_secs(5));
+                Ok(())
+            })
+            .await;
+
+        assert!(
+            matches!(result, Err(dkg_core::Error::Overloaded(_))),
+            "expected Overloaded, got {result:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "caller waited {:?}: the execution ceiling did not bound it",
+            start.elapsed()
+        );
+    }
+
+    /// The ceiling is opt-out, so an operator who would rather wait than see a
+    /// 503 keeps the previous unbounded behaviour.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_execute_timeout_waits_for_the_job() {
+        let pool = WorkerPool::spawn(
+            "test",
+            Counter::new(),
+            PoolConfig {
+                readers: 1,
+                queue_depth: 16,
+                enqueue_timeout: Duration::from_secs(5),
+                execute_timeout: None,
+                commit: CommitConfig::default(),
+            },
+        );
+
+        let result = pool
+            .read(|c| {
+                std::thread::sleep(Duration::from_millis(200));
+                Ok(c.0.load(Ordering::SeqCst))
+            })
+            .await;
+        assert_eq!(result.unwrap(), 0, "the job should have been awaited");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn saturated_queue_yields_overloaded() {
         // One reader, a depth-1 queue, and a short enqueue timeout. Filling
@@ -411,11 +805,13 @@ mod tests {
         // next submit to time out as Overloaded.
         let pool = WorkerPool::spawn(
             "test",
-            Counter(Arc::new(AtomicUsize::new(0))),
+            Counter::new(),
             PoolConfig {
                 readers: 1,
                 queue_depth: 1,
                 enqueue_timeout: Duration::from_millis(50),
+                execute_timeout: None,
+                commit: CommitConfig::default(),
             },
         );
 

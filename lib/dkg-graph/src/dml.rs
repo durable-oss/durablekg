@@ -441,13 +441,32 @@ pub fn insert_aliases_sql(
     entity_id: &str,
     aliases: &[(String, String)],
 ) -> String {
-    let rows: Vec<String> = aliases
+    let owned: Vec<(String, String, String)> = aliases
         .iter()
-        .map(|(t, v)| {
+        .map(|(t, v)| (t.clone(), v.clone(), entity_id.to_string()))
+        .collect();
+    insert_alias_rows_sql(alias_table, &owned)
+}
+
+/// `INSERT` alias mappings for *many* entities in one statement.
+///
+/// Each row is `(alias_type, alias_value, entity_id)`. Batching matters: one
+/// statement per entity turns a bulk sync into a round trip per entity, which
+/// is the dominant cost once the rows themselves are batched.
+///
+/// Returns an empty string when there is nothing to write, so callers can skip
+/// the round trip entirely.
+pub fn insert_alias_rows_sql(alias_table: &str, rows: &[(String, String, String)]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    let values: Vec<String> = rows
+        .iter()
+        .map(|(alias_type, alias_value, entity_id)| {
             format!(
                 "({}, {}, toUUID({}), now64(3))",
-                quote_string(t),
-                quote_string(v),
+                quote_string(alias_type),
+                quote_string(alias_value),
                 quote_string(entity_id)
             )
         })
@@ -456,7 +475,81 @@ pub fn insert_aliases_sql(
         "INSERT INTO `{}` (`alias_type`, `alias_value`, `entity_id`, `{}`) VALUES {}",
         alias_table,
         crate::ddl::VERSION_COLUMN,
-        rows.join(", ")
+        values.join(", ")
+    )
+}
+
+/// `SELECT` every `(alias_type, alias_value)` registered for `entity_id` — the
+/// reverse of [`select_alias_sql`].
+///
+/// Facts are indexed under the exact entity URN the caller recorded them with,
+/// so an entity written under several aliases has its facts split across
+/// several URN keys. Syncing needs all of them, which means asking the alias
+/// table what other names this entity answers to.
+///
+/// `FINAL` collapses superseded mappings so a re-pointed alias is not returned
+/// for its former entity.
+pub fn select_aliases_for_entity_sql(alias_table: &str, entity_id: &str) -> String {
+    format!(
+        "SELECT `alias_type`, `alias_value` FROM `{}` FINAL WHERE `entity_id` = toUUID({})",
+        alias_table,
+        quote_string(entity_id)
+    )
+}
+
+/// `SELECT` every registered alias for *many* `entity_id`s in one query — the
+/// bulk form of [`select_aliases_for_entity_sql`].
+///
+/// `entity_id` comes back alongside the alias columns so the caller can bucket
+/// each row by the entity it belongs to. `FINAL` collapses superseded
+/// mappings, matching the single-entity form.
+///
+/// Returns an empty string for an empty input, so callers can skip the query.
+pub fn select_aliases_for_entities_sql(alias_table: &str, entity_ids: &[String]) -> String {
+    if entity_ids.is_empty() {
+        return String::new();
+    }
+    let ids: Vec<String> = entity_ids
+        .iter()
+        .map(|id| format!("toUUID({})", quote_string(id)))
+        .collect();
+    format!(
+        "SELECT `alias_type`, `alias_value`, `entity_id` FROM `{}` FINAL WHERE `entity_id` IN ({})",
+        alias_table,
+        ids.join(", ")
+    )
+}
+
+/// `SELECT` the `entity_id` for *many* `(alias_type, alias_value)` pairs in one
+/// query, replacing a round trip per alias with a single statement.
+///
+/// The predicate is a disjunction of exact pairs rather than two independent
+/// `IN` lists: `alias_type IN (..) AND alias_value IN (..)` would match the
+/// cross product and resolve aliases that were never asked for.
+///
+/// `FINAL` collapses superseded mappings, matching [`select_alias_sql`]. The
+/// alias columns come back alongside `entity_id` so the caller can attribute
+/// each row to the pair that produced it.
+///
+/// Returns an empty string for an empty input, so callers can skip the query.
+pub fn select_aliases_sql(alias_table: &str, aliases: &[(String, String)]) -> String {
+    if aliases.is_empty() {
+        return String::new();
+    }
+    let predicates: Vec<String> = aliases
+        .iter()
+        .map(|(alias_type, alias_value)| {
+            format!(
+                "(`alias_type` = {} AND `alias_value` = {})",
+                quote_string(alias_type),
+                quote_string(alias_value)
+            )
+        })
+        .collect();
+    format!(
+        "SELECT `alias_type`, `alias_value`, `entity_id` FROM `{}` FINAL WHERE {}",
+        alias_table,
+        predicates.join(" OR ")
     )
 }
 
@@ -778,6 +871,122 @@ mod tests {
     fn count_without_filter() {
         let sql = count_sql(&table(), &[]).unwrap();
         assert_eq!(sql, "SELECT count() AS `_dkg_count` FROM `people` FINAL");
+    }
+
+    #[test]
+    fn select_aliases_matches_exact_pairs_not_the_cross_product() {
+        let sql = select_aliases_sql(
+            "people_aliases",
+            &[
+                ("slug".into(), "ada".into()),
+                ("email".into(), "ada@example.com".into()),
+            ],
+        );
+        assert_eq!(
+            sql,
+            "SELECT `alias_type`, `alias_value`, `entity_id` FROM `people_aliases` FINAL \
+             WHERE (`alias_type` = 'slug' AND `alias_value` = 'ada') \
+             OR (`alias_type` = 'email' AND `alias_value` = 'ada@example.com')"
+        );
+        // The pairs must stay bound together: a cross-product form would
+        // resolve `slug=ada@example.com`, an alias nobody asked about.
+        assert!(!sql.contains("IN ("));
+    }
+
+    #[test]
+    fn select_aliases_of_nothing_is_empty() {
+        assert_eq!(select_aliases_sql("people_aliases", &[]), "");
+    }
+
+    #[test]
+    fn select_aliases_for_entities_reads_many_entities_in_one_query() {
+        let sql = select_aliases_for_entities_sql(
+            "people_aliases",
+            &[
+                "0f8fad5b-d9cb-469f-a165-70867728950e".into(),
+                "7c9e6679-7425-40de-944b-e07fc1f90ae7".into(),
+            ],
+        );
+        assert_eq!(
+            sql,
+            "SELECT `alias_type`, `alias_value`, `entity_id` FROM `people_aliases` FINAL \
+             WHERE `entity_id` IN (toUUID('0f8fad5b-d9cb-469f-a165-70867728950e'), \
+             toUUID('7c9e6679-7425-40de-944b-e07fc1f90ae7'))"
+        );
+        // `entity_id` comes back so the caller can bucket rows by entity;
+        // without it a batch could not tell whose alias is whose.
+        assert!(sql.contains("`entity_id`"));
+    }
+
+    #[test]
+    fn select_aliases_for_entities_of_nothing_is_empty() {
+        assert_eq!(select_aliases_for_entities_sql("people_aliases", &[]), "");
+    }
+
+    #[test]
+    fn select_aliases_for_entities_quotes_its_ids() {
+        // Entity ids reach the statement as literals, so a quote in one must
+        // be escaped rather than closing the string.
+        let sql = select_aliases_for_entities_sql("people_aliases", &["a'b".into()]);
+        assert!(!sql.contains("('a'b')"), "unescaped quote: {sql}");
+    }
+
+    #[test]
+    fn insert_alias_rows_batches_many_entities() {
+        let sql = insert_alias_rows_sql(
+            "people_aliases",
+            &[
+                (
+                    "slug".into(),
+                    "ada".into(),
+                    "00000000-0000-0000-0000-000000000001".into(),
+                ),
+                (
+                    "slug".into(),
+                    "bob".into(),
+                    "00000000-0000-0000-0000-000000000002".into(),
+                ),
+            ],
+        );
+        // One statement, two rows, each pointing at its own entity.
+        assert_eq!(sql.matches("INSERT INTO").count(), 1);
+        assert!(sql.contains("('slug', 'ada', toUUID('00000000-0000-0000-0000-000000000001')"));
+        assert!(sql.contains("('slug', 'bob', toUUID('00000000-0000-0000-0000-000000000002')"));
+    }
+
+    #[test]
+    fn insert_alias_rows_of_nothing_is_empty() {
+        assert_eq!(insert_alias_rows_sql("people_aliases", &[]), "");
+    }
+
+    #[test]
+    fn insert_aliases_still_writes_one_entitys_pairs() {
+        // The single-entity helper now delegates to the batch form; its
+        // output must not change.
+        let sql = insert_aliases_sql(
+            "people_aliases",
+            "00000000-0000-0000-0000-000000000001",
+            &[("slug".into(), "ada".into())],
+        );
+        assert!(sql.starts_with(
+            "INSERT INTO `people_aliases` (`alias_type`, `alias_value`, `entity_id`, `_dkg_version`) VALUES "
+        ));
+        assert!(sql.contains("('slug', 'ada', toUUID('00000000-0000-0000-0000-000000000001')"));
+    }
+
+    #[test]
+    fn insert_batches_many_rows_into_one_statement() {
+        let sql = insert_sql(
+            &table(),
+            &[
+                record(json!({ "name": "Ada", "nicknames": [] })),
+                record(json!({ "name": "Bob", "nicknames": [] })),
+            ],
+        )
+        .unwrap();
+        assert_eq!(sql.matches("INSERT INTO").count(), 1);
+        assert!(sql.contains("('Ada', []"));
+        assert!(sql.contains("('Bob', []"));
     }
 
     #[test]

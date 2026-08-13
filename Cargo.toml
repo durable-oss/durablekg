@@ -45,6 +45,11 @@ tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["json", "macros"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
+# Unix-socket serving: axum 0.7's `serve` takes a TcpListener concretely, so
+# the UDS accept loop drives hyper directly. Both are already in the tree as
+# axum's own dependencies; declaring them keeps the versions explicit.
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "tokio"] }
 
 # Storage — feature A document store is a composite of three layers:
 #   opendal: blob storage for document bodies (filesystem or object store)
@@ -58,6 +63,9 @@ clickhouse = { version = "0.13", features = ["uuid", "chrono"] }
 
 # Plugin / registry pattern — used across the workspace for extensibility.
 inventory = "0.3"
+
+# Async combinators (bounded-concurrency streams on the bulk sync path).
+futures = "0.3"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

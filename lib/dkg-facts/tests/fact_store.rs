@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use dkg_documents::{DocumentStore, ObjectDocumentStore, Query, Urn};
+use dkg_documents::{DocumentStore, NewDocument, ObjectDocumentStore, Query, Urn};
 use dkg_facts::{
     facts_collection, Authority, DocumentFactStore, FactStore, NewBundle, NewFact, SourceType,
 };
@@ -194,4 +194,156 @@ async fn facts_land_in_a_per_table_collection() {
     assert_eq!(in_people.len(), 1);
     assert_eq!(in_businesses[0].collection, "facts:businesses");
     assert_eq!(in_people[0].collection, "facts:people");
+}
+
+#[tokio::test]
+async fn facts_for_many_returns_each_entitys_own_facts() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = fact_store(&dir);
+
+    let acme = Urn::new("businesses", "acme").unwrap();
+    let globex = Urn::new("businesses", "globex").unwrap();
+    store
+        .record(NewFact::manual(acme.clone(), "phone", "603-555-1234"))
+        .await
+        .unwrap();
+    store
+        .record(NewFact::manual(acme.clone(), "industry", "printing"))
+        .await
+        .unwrap();
+    store
+        .record(NewFact::manual(globex.clone(), "phone", "212-555-0000"))
+        .await
+        .unwrap();
+
+    let got = store
+        .facts_for_many(&[acme.clone(), globex.clone()])
+        .await
+        .unwrap();
+
+    // Each entity gets exactly its own facts — the bulk read must bucket by
+    // URN, not merge the collection.
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[&acme.to_string()].len(), 2);
+    assert_eq!(got[&globex.to_string()].len(), 1);
+    assert_eq!(got[&globex.to_string()][0].value, serde_json::json!("212-555-0000"));
+
+    // And it agrees with reading them one at a time.
+    for entity in [&acme, &globex] {
+        let single = store.facts_for(entity).await.unwrap();
+        assert_eq!(single.len(), got[&entity.to_string()].len());
+    }
+}
+
+#[tokio::test]
+async fn facts_for_many_omits_entities_with_no_facts() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = fact_store(&dir);
+
+    let acme = Urn::new("businesses", "acme").unwrap();
+    let ghost = Urn::new("businesses", "nobody").unwrap();
+    store
+        .record(NewFact::manual(acme.clone(), "phone", "603-555-1234"))
+        .await
+        .unwrap();
+
+    let got = store.facts_for_many(&[acme.clone(), ghost.clone()]).await.unwrap();
+
+    // Absent, not present-and-empty: the sync path distinguishes "no facts"
+    // from "not asked for", and writing an empty overview would clobber a row.
+    assert!(got.contains_key(&acme.to_string()));
+    assert!(!got.contains_key(&ghost.to_string()));
+}
+
+#[tokio::test]
+async fn facts_for_many_spans_namespaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = fact_store(&dir);
+
+    // Facts live in a per-namespace collection, so a batch crossing namespaces
+    // must read each one rather than only the first.
+    let business = Urn::new("businesses", "acme").unwrap();
+    let person = Urn::new("people", "jane").unwrap();
+    store
+        .record(NewFact::manual(business.clone(), "phone", "603-555-1234"))
+        .await
+        .unwrap();
+    store
+        .record(NewFact::manual(person.clone(), "email", "jane@example.com"))
+        .await
+        .unwrap();
+
+    let got = store
+        .facts_for_many(&[business.clone(), person.clone()])
+        .await
+        .unwrap();
+
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[&business.to_string()][0].dimension, "phone");
+    assert_eq!(got[&person.to_string()][0].dimension, "email");
+}
+
+#[tokio::test]
+async fn facts_for_many_handles_an_empty_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = fact_store(&dir);
+    assert!(store.facts_for_many(&[]).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn facts_for_many_skips_a_corrupt_document_instead_of_failing_the_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, docs) = stores(&dir);
+
+    let acme = Urn::new("businesses", "acme").unwrap();
+    let broken = Urn::new("businesses", "broken").unwrap();
+    store
+        .record(NewFact::manual(acme.clone(), "phone", "603-555-1234"))
+        .await
+        .unwrap();
+
+    // A document that lands in the same collection, metadata-tagged for
+    // `broken`, but whose body does not deserialize as a `StoredBundle` —
+    // simulating a corrupt/malformed record without going through the fact
+    // store's own (always-valid) write path.
+    docs.create(NewDocument {
+        collection: facts_collection(broken.namespace()),
+        search_ids: Vec::new(),
+        body: serde_json::json!({ "not": "a stored bundle" }),
+        metadata: serde_json::json!({ "entity": broken.to_string() }),
+    })
+    .await
+    .unwrap();
+
+    let got = store
+        .facts_for_many(&[acme.clone(), broken.clone()])
+        .await
+        .unwrap();
+
+    // The corrupt entity is simply absent — not an error that blanks the
+    // whole batch. `acme`, which shares the same namespace and would be read
+    // in the same `search_grouped` call, still comes back intact.
+    assert!(got.contains_key(&acme.to_string()), "a healthy entity in the same batch must still be returned");
+    assert_eq!(got[&acme.to_string()][0].value, serde_json::json!("603-555-1234"));
+    assert!(!got.contains_key(&broken.to_string()), "the corrupt entity is omitted, not surfaced as an error");
+}
+
+#[tokio::test]
+async fn facts_for_many_deduplicates_a_repeated_entity() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = fact_store(&dir);
+
+    let acme = Urn::new("businesses", "acme").unwrap();
+    store
+        .record(NewFact::manual(acme.clone(), "phone", "603-555-1234"))
+        .await
+        .unwrap();
+
+    // The same URN twice is one entity; its facts must not be doubled.
+    let got = store
+        .facts_for_many(&[acme.clone(), acme.clone()])
+        .await
+        .unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[&acme.to_string()].len(), 1);
 }

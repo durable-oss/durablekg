@@ -17,14 +17,18 @@
 //! The [`transform`] module wires both into a feature-D [`Transform`], so a
 //! bulk job can turn a collection of fact documents into graph rows.
 
+pub mod queue;
 pub mod record;
 pub mod resolve;
 pub mod sync;
 pub mod transform;
 
+pub use queue::{SyncPass, SyncQueue};
 pub use record::{is_blank_alias, to_record};
 pub use resolve::{resolve, ResolvedDimension, ResolvedEntity};
-pub use sync::{parse_typed_id, sync_entity, SyncOutcome};
+pub use sync::{
+    parse_typed_id, sync_entities, sync_entity, sync_table, SyncOutcome, TableSyncSummary,
+};
 pub use transform::resolve_entity;
 
 // Copyright (c) 2026 Durable Programming, LLC. All rights reserved.

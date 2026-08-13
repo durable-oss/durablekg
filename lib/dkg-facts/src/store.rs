@@ -125,12 +125,73 @@ pub trait FactStore: Send + Sync {
     /// Returns [`Error::Storage`] on backend failure.
     async fn facts_for(&self, entity: &Urn) -> Result<Vec<Fact>>;
 
+    /// Every fact recorded about each of `entities`, keyed by the URN string
+    /// the facts were recorded under.
+    ///
+    /// The bulk form of [`facts_for`](Self::facts_for). Reading one entity's
+    /// facts costs a scan of its namespace's fact collection, so resolving a
+    /// batch one entity at a time costs that scan once per entity; this reads
+    /// each namespace once for the whole set. The batch sync path uses it to
+    /// gather facts for hundreds of entities (and every alias form each
+    /// answers to) in a single pass.
+    ///
+    /// Entities with no facts are **absent** from the map rather than mapped
+    /// to an empty vector. Entities spanning several namespaces are handled;
+    /// each namespace is read once.
+    ///
+    /// The default implementation calls [`facts_for`](Self::facts_for) per
+    /// entity, so an implementor with no bulk path stays correct.
+    ///
+    /// A single entity's read failing does not fail the batch: that entity
+    /// is simply absent from the returned map (the same shape as "no facts
+    /// recorded"), and every other entity's facts are still returned. A
+    /// batch sync caller that cannot distinguish "no facts" from "read
+    /// failed" would otherwise treat one bad entity's storage fault as every
+    /// entity in the batch having no facts, since callers commonly fall back
+    /// to an empty map on `Err` — silently blanking hundreds of unrelated,
+    /// perfectly readable entities every pass.
+    ///
+    /// # Errors
+    ///
+    /// This default implementation never returns `Err`; a per-entity read
+    /// failure is swallowed and that entity is simply omitted. A concrete
+    /// backend override may still document its own error conditions if it
+    /// cannot offer that same isolation.
+    async fn facts_for_many(
+        &self,
+        entities: &[Urn],
+    ) -> Result<std::collections::HashMap<String, Vec<Fact>>> {
+        let mut out = std::collections::HashMap::new();
+        for entity in entities {
+            let Ok(facts) = self.facts_for(entity).await else {
+                continue;
+            };
+            if !facts.is_empty() {
+                out.insert(entity.to_string(), facts);
+            }
+        }
+        Ok(out)
+    }
+
     /// Every fact about `entity` claiming the given `dimension`.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Storage`] on backend failure.
     async fn facts_on(&self, entity: &Urn, dimension: &str) -> Result<Vec<Fact>>;
+
+    /// Every distinct entity that has at least one fact recorded about it in
+    /// `table`'s fact collection, in unspecified order.
+    ///
+    /// Entities are returned in the URN form their facts were recorded under.
+    /// The same entity can appear more than once when its facts were recorded
+    /// through different aliases; the sync path canonicalizes those, so the
+    /// duplicates cost a redundant sync rather than a wrong result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] on backend failure.
+    async fn entities_in(&self, table: &str) -> Result<Vec<Urn>>;
 }
 
 /// A [`FactStore`] backed by any [`DocumentStore`].
@@ -250,6 +311,61 @@ impl FactStore for DocumentFactStore {
         Ok(facts)
     }
 
+    async fn facts_for_many(
+        &self,
+        entities: &[Urn],
+    ) -> Result<std::collections::HashMap<String, Vec<Fact>>> {
+        use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+        // Facts live in a per-namespace collection, and one `search_grouped`
+        // covers a single collection — so bucket the requested URNs by
+        // namespace and read each namespace once. Deduplicated: the same URN
+        // asked for twice is one lookup.
+        let mut by_namespace: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+        for entity in entities {
+            by_namespace
+                .entry(entity.namespace())
+                .or_default()
+                .insert(entity.to_string());
+        }
+
+        // Isolated per namespace and per entity: a namespace whose
+        // `search_grouped` call fails, or a single entity whose stored
+        // document does not parse, is skipped rather than failing the whole
+        // batch. A batch sync caller — see `dkg-entity-fact-resolver`'s
+        // `prepare_batch` — reads hundreds of entities across many
+        // namespaces in one call; without this isolation, one bad namespace
+        // or one corrupt document silently blanks facts for every other
+        // entity in the batch, which a caller that falls back to an empty
+        // map on error cannot tell apart from "these entities have no
+        // facts". Those entities are simply absent from the returned map,
+        // same as "no facts recorded".
+        let mut out = HashMap::new();
+        for (namespace, urns) in by_namespace {
+            let values: Vec<String> = urns.into_iter().collect();
+            let Ok(grouped) = self
+                .docs
+                .search_grouped(&facts_collection(namespace), "entity", &values, self.limit)
+                .await
+            else {
+                continue;
+            };
+            for (urn, docs) in grouped {
+                let mut facts = Vec::new();
+                for doc in docs {
+                    let Ok(parsed) = Self::facts_from_doc(doc) else {
+                        continue;
+                    };
+                    facts.extend(parsed);
+                }
+                if !facts.is_empty() {
+                    out.insert(urn, facts);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     async fn facts_on(&self, entity: &Urn, dimension: &str) -> Result<Vec<Fact>> {
         // Bundles store their dimensions as an array, which the document
         // store's containment query can't index into; pull the entity's
@@ -261,6 +377,41 @@ impl FactStore for DocumentFactStore {
             .into_iter()
             .filter(|f| f.dimension == dimension)
             .collect())
+    }
+
+    async fn entities_in(&self, table: &str) -> Result<Vec<Urn>> {
+        // Every bundle lifts its entity URN into metadata, so listing the
+        // table's fact collection and reading that field enumerates the
+        // entities without deserializing the bundle bodies.
+        //
+        // The per-query cap is deliberately *not* applied here: it exists to
+        // bound one entity's fact list, and silently truncating an
+        // enumeration would make a "sync everything" caller quietly skip
+        // entities it believed it had covered.
+        let query = Query {
+            collection: Some(facts_collection(table)),
+            text: None,
+            metadata_contains: json!({}),
+            limit: usize::MAX,
+        };
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut out = Vec::new();
+        for doc in self.docs.search(query).await? {
+            let Some(entity) = doc.metadata.get("entity").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if !seen.insert(entity.to_string()) {
+                continue;
+            }
+            match entity.parse::<Urn>() {
+                Ok(urn) => out.push(urn),
+                // A metadata entry that is not a valid URN cannot be synced;
+                // skip it rather than failing the whole enumeration.
+                Err(_) => continue,
+            }
+        }
+        Ok(out)
     }
 }
 

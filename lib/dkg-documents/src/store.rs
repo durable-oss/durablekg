@@ -7,6 +7,7 @@
 //! [`crate::object`], registered for the `dkg` scheme; additional backends
 //! register the same way.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -72,6 +73,29 @@ pub trait DocumentStore: Send + Sync {
     /// [`dkg_core::Error::Storage`] on backend failure.
     async fn delete(&self, id: Uuid) -> Result<()>;
 
+    /// Force any staged writes to be made durable and visible, blocking
+    /// until they are.
+    ///
+    /// Backends that group-commit (the default object store fsyncs Fjall and
+    /// commits Tantivy on an interval) acknowledge a write before it is
+    /// durable and before the full-text index can return it. Call this when
+    /// you need read-your-writes — a search that must see a document just
+    /// created, or a durability point before some external side effect.
+    ///
+    /// Bulk ingestion should *not* call this per document: doing so
+    /// reintroduces exactly the per-write barrier that group commit exists to
+    /// amortize. Call it once at the end of a batch.
+    ///
+    /// The default implementation is a no-op, for backends that commit
+    /// synchronously and therefore have nothing to flush.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`dkg_core::Error::Storage`] if the flush fails.
+    async fn flush(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Search for documents matching `query`. When `query.text` is set the
     /// full-text index is consulted; otherwise documents are listed by
     /// collection / metadata containment.
@@ -80,6 +104,53 @@ pub trait DocumentStore: Send + Sync {
     ///
     /// Returns [`dkg_core::Error::Storage`] on backend failure.
     async fn search(&self, query: Query) -> Result<Vec<Document>>;
+
+    /// Group a collection's documents by the value of one top-level metadata
+    /// field, keeping only the values in `values`.
+    ///
+    /// This is the bulk form of a metadata-equality [`search`](Self::search):
+    /// where searching for one field value scans the collection once per
+    /// value, this scans it **once** for the whole set and buckets as it goes.
+    /// Callers resolving many entities at a time (the fact resolver's batch
+    /// sync) go from O(values x collection) to O(collection).
+    ///
+    /// Values absent from the collection are absent from the returned map
+    /// rather than present with an empty vector, so a caller can tell "no
+    /// documents" from "not asked for". Documents whose `field` is missing or
+    /// not a string are skipped. `limit_per_value` caps each bucket
+    /// independently, matching the per-query cap the single-value path
+    /// applies.
+    ///
+    /// The default implementation falls back to one `search` per value, so a
+    /// backend that has nothing better stays correct. Backends able to scan
+    /// once should override it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`dkg_core::Error::Storage`] on backend failure.
+    async fn search_grouped(
+        &self,
+        collection: &str,
+        field: &str,
+        values: &[String],
+        limit_per_value: usize,
+    ) -> Result<HashMap<String, Vec<Document>>> {
+        let mut out = HashMap::new();
+        for value in values {
+            let docs = self
+                .search(Query {
+                    collection: Some(collection.to_string()),
+                    text: None,
+                    metadata_contains: serde_json::json!({ field: value }),
+                    limit: limit_per_value,
+                })
+                .await?;
+            if !docs.is_empty() {
+                out.insert(value.clone(), docs);
+            }
+        }
+        Ok(out)
+    }
 
     /// Reconcile the store after a partial write or crash: re-drive any
     /// document left in a non-final state (body present but not yet

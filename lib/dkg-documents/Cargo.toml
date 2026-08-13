@@ -23,6 +23,7 @@ thiserror.workspace = true
 async-trait = "0.1"
 tokio = { workspace = true }
 async-channel = "2"
+futures.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true

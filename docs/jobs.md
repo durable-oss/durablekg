@@ -1,7 +1,7 @@
-# Jobs (feature D)
+# Jobs
 
-Feature D runs bulk jobs that process document data (feature A) into relational
-records (feature B). A job reads a collection's worth of documents, runs each
+Jobs run bulk work that processes document data into relational
+records. A job reads a collection's worth of documents, runs each
 through a registered `Transform`, and inserts the resulting records into the
 configured tables.
 
@@ -30,14 +30,14 @@ resolves the transform by name at run time.
 
 ## Relationship to facts
 
-Fact resolution (see [facts.md](facts.md)) is a feature-D-shaped job that the
+Fact resolution (see [facts.md](facts.md)) is a job-shaped task that the
 current `Transform` interface cannot express on its own: a `Transform` sees one
 document at a time, but resolving an entity's overview needs **all** of its
 facts together.
 
 So `dkg-entity-fact-resolver` provides `sync_entity`, the per-entity form —
 gather → resolve → project → insert — driven one entity at a time from the CLI
-and HTTP API. A future feature-D runner that groups fact documents by entity
+and HTTP API. A future bulk-job runner that groups fact documents by entity
 before transforming would let the same resolve → project → insert step run as a
 bulk job.
 

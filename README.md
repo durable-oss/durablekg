@@ -4,15 +4,15 @@ DurableKG is an API-first knowledge and document platform from
 [Durable Programming](https://durableprogramming.com). It offers four
 capabilities, built up across a Rust workspace:
 
-- **A — Documents.** Store semistructured data with rich metadata, in a
+- **Documents.** Store semistructured data with rich metadata, in a
   searchable form.
-- **B — Relational records.** Define tables (e.g. `people`, `businesses`)
+- **Relational records.** Define tables (e.g. `people`, `businesses`)
   and the relationships between them, then query each table and traverse
   associations. Backed by ClickHouse.
-- **C — Endpoints.** Define API endpoints whose results are automatically
+- **Endpoints.** Define API endpoints whose results are automatically
   stored as documents, with user-controlled caching.
-- **D — Jobs.** Run bulk jobs that process document data (A) into relational
-  records (B).
+- **Jobs.** Run bulk jobs that process document data into relational
+  records.
 
 On top of the relational layer, DurableKG stores **facts** — authority-stamped
 claims about an entity (`phone`, `industry`, …), each carrying a source and a
@@ -29,7 +29,7 @@ two tables by name, and an `endpoint` defines a caching route.
 
 ## Status
 
-Feature **A** (documents) is implemented end to end behind an HTTP API and a
+Documents are implemented end to end behind an HTTP API and a
 CLI. The default store composes three embedded layers:
 
 - **[OpenDAL]** — blob storage for document bodies (local filesystem by
@@ -57,7 +57,7 @@ requests finish, then drains the worker pools — queued jobs run and the
 threads join — so no write is lost and the Tantivy index commits before the
 process exits.
 
-Feature **B** (relational records) is wired end to end. A schema of `table`
+Relational records are wired end to end. A schema of `table`
 and `relationship` entities is loaded from a config directory, validated once,
 and reconciled into ClickHouse **additively** — missing tables, columns, and
 many-to-many join tables are created, nothing is ever dropped (cleanup is out
@@ -65,7 +65,7 @@ of band). The HTTP API and CLI expose per-table insert and query plus
 relationship traversal (`belongs_to` / `has_many` / `many_to_many`), verified
 against a live ClickHouse.
 
-Feature **C** (caching endpoints) is wired end to end. Endpoints loaded from
+Caching endpoints are wired end to end. Endpoints loaded from
 the config directory are mounted at `GET /v1/endpoints/:name`; a call returns
 a fresh cached result (`now - created_at < cache_seconds`) or fetches the
 upstream, stores it as a document, and returns it. An endpoint config
@@ -76,11 +76,11 @@ forward correctly and cache independently. The endpoint can authenticate
 itself to its upstream via `:auth` (`bearer` / `header` / `query`), with the
 credential referenced by name and resolved from `DKG_SECRET_<name>` at call
 time — never stored in config, the cache, or logs. `Authorization`/`Cookie`
-headers are never forwarded from the caller. Feature **D** remains scaffolded.
+headers are never forwarded from the caller. Bulk jobs remain scaffolded.
 
-**Facts** are wired end to end on top of features A and B. A fact is recorded
+**Facts** are wired end to end on top of documents and relational records. A fact is recorded
 as a document in a per-table `facts:<table>` collection (so they ride on
-feature A — no extra backend); `record`, list, and resolve are exposed over
+the document store — no extra backend); `record`, list, and resolve are exposed over
 HTTP and the CLI. Resolution picks, per dimension, the highest-confidence fact
 (ties broken by recency) and keeps the winning source. Every table is keyed on
 a system-owned `id` (a uuid DurableKG mints; authors never declare it) and may
@@ -101,11 +101,11 @@ instead of duplicating it. See [docs/facts.md](docs/facts.md).
 ```
 lib/
   dkg-core        Shared Error, Settings, and the inventory-based plugin registry
-  dkg-documents   Feature A — DocumentStore trait + composite OpenDAL/Fjall/Tantivy backend
+  dkg-documents   Documents — DocumentStore trait + composite OpenDAL/Fjall/Tantivy backend
   dkg-config      Trongoscript config loading; typed Table / Relationship / Endpoint schemas
-  dkg-graph       Feature B — relational store (Schema loader + ClickHouse backend)
-  dkg-endpoints   Feature C — caching API endpoints over the document store
-  dkg-jobs        Feature D — document→record bulk transforms
+  dkg-graph       Relational records — relational store (Schema loader + ClickHouse backend)
+  dkg-endpoints   Endpoints — caching API endpoints over the document store
+  dkg-jobs        Jobs — document→record bulk transforms
   dkg-facts       Fact storage (authority-stamped claims) over the document store
   dkg-entity-fact-resolver  Resolve facts → overview row; sync into a table
 apps/
@@ -134,18 +134,19 @@ Configuration is read from the environment (with local defaults):
 | Variable                     | Default                              | Purpose                         |
 | ---------------------------- | ------------------------------------ | ------------------------------- |
 | `DKG_DOCUMENT_DATABASE_URL`  | `dkg://./data`                       | Document store root (`dkg://<path>`) |
-| `DKG_GRAPH_DATABASE_URL`     | *(unset → feature B off)*            | ClickHouse URL, e.g. `clickhouse://localhost:8123/kg` |
-| `DKG_CONFIG_DIR`             | *(unset)*                            | Directory of `.trongo` table/relationship configs |
+| `DKG_GRAPH_DATABASE_URL`     | *(unset → relational records off)*   | ClickHouse URL, e.g. `clickhouse://localhost:8123/kg` |
+| `DKG_CONFIG_DIR`             | *(unset)*                            | Directory of `.trongo` table/relationship configs (searched recursively) |
 | `DKG_BIND_ADDRESS`           | `127.0.0.1:8080`                     | HTTP server bind address        |
 | `DKG_API_KEY`                | *(unset → no inbound auth)*          | Fixed API key every `/v1/*` route requires |
 | `DKG_STORE_READERS`          | `4`                                  | Reader threads per blocking subsystem |
 | `DKG_STORE_QUEUE_DEPTH`      | `1024`                               | Bounded worker-queue capacity   |
 | `DKG_STORE_ENQUEUE_TIMEOUT_MS` | `250`                              | Backpressure wait before `503`  |
+| `DKG_STORE_EXECUTE_TIMEOUT_MS` | `30000`                            | Ceiling on a single store job before `503` (`0` waits forever) |
 
 The `dkg://<path>` URL opens the composite store rooted at `<path>`, which
 holds `blobs/` (bodies), `meta/` (Fjall), and `index/` (Tantivy). The
-`DKG_STORE_*` knobs tune the Fjall/Tantivy worker pools. Feature B (relational
-records) turns on only when `DKG_GRAPH_DATABASE_URL` is set; on boot the server
+`DKG_STORE_*` knobs tune the Fjall/Tantivy worker pools. Relational records
+turn on only when `DKG_GRAPH_DATABASE_URL` is set; on boot the server
 loads the `DKG_CONFIG_DIR` tables/relationships and reconciles them into
 ClickHouse.
 
@@ -183,20 +184,20 @@ curl -H 'Authorization: Bearer change-me' http://localhost:8080/v1/documents/sea
 | GET    | `/v1/documents/:id`               | Fetch a document                     |
 | PUT    | `/v1/documents/:id`               | Replace a document                   |
 | DELETE | `/v1/documents/:id`               | Delete a document                    |
-| POST   | `/v1/tables/:table`               | Insert record(s) into a table (B)    |
-| POST   | `/v1/tables/:table/query`         | Query a table (filters, sort, page) (B) |
-| POST   | `/v1/tables/:table/count`         | Count rows matching filters (B)      |
-| POST   | `/v1/tables/:table/:id/related/:other` | Traverse a relationship (B)     |
-| GET    | `/v1/endpoints/:name`             | Call a caching endpoint (C)          |
+| POST   | `/v1/tables/:table`               | Insert record(s) into a table        |
+| POST   | `/v1/tables/:table/query`         | Query a table (filters, sort, page)  |
+| POST   | `/v1/tables/:table/count`         | Count rows matching filters          |
+| POST   | `/v1/tables/:table/:id/related/:other` | Traverse a relationship         |
+| GET    | `/v1/endpoints/:name`             | Call a caching endpoint              |
 | POST   | `/v1/facts`                       | Record a fact about an entity        |
 | GET    | `/v1/facts?entity=&dimension=`    | List an entity's facts               |
 | POST   | `/v1/facts/resolve`               | Resolve facts into an overview row   |
-| POST   | `/v1/facts/sync`                  | Resolve + write the row (B)          |
+| POST   | `/v1/facts/sync`                  | Resolve + write the row              |
 
-The `/v1/tables/*` routes return `503`-style errors unless feature B is
-configured. `/v1/endpoints/:name` requires an endpoint of that name in the
-config directory (else `404`); it caches results as documents, so feature A
-is always available. A record is a JSON object keyed by column name (insert accepts an
+The `/v1/tables/*` routes return `503`-style errors unless relational records
+are configured. `/v1/endpoints/:name` requires an endpoint of that name in the
+config directory (else `404`); it caches results as documents, so document
+storage is always available. A record is a JSON object keyed by column name (insert accepts an
 object or an array); a table query body is
 `{ filters?: [{column, op, value}], order_by?: {column, direction}, offset?, limit? }`,
 where `op` is one of `eq` (default), `ne`, `gt`, `gte`, `lt`, `lte`, `in`
@@ -225,7 +226,7 @@ cargo run -p dkg-cli -- doc search --text "embedded search"
 cargo run -p dkg-cli -- doc search --collection articles --limit 20
 cargo run -p dkg-cli -- doc repair                  # reconcile after a crash
 
-# Relational records (feature B): set --graph-url / --config-dir or the
+# Relational records: set --graph-url / --config-dir or the
 # DKG_GRAPH_DATABASE_URL / DKG_CONFIG_DIR env vars.
 cargo run -p dkg-cli -- schema reconcile
 cargo run -p dkg-cli -- table insert businesses biz.json
@@ -234,7 +235,7 @@ cargo run -p dkg-cli -- table query businesses --filter 'employees_estimate>=50'
 cargo run -p dkg-cli -- table count businesses --filter 'state=NH'
 cargo run -p dkg-cli -- table related people <uuid> businesses
 
-# Caching endpoints (feature C): needs --config-dir / DKG_CONFIG_DIR.
+# Caching endpoints: needs --config-dir / DKG_CONFIG_DIR.
 cargo run -p dkg-cli -- endpoint call weather --query city=portland
 
 # Facts (ride on the document store; resolve/sync also need the schema/graph).
@@ -252,7 +253,7 @@ See [`examples/configs`](examples/configs) for annotated config samples.
 ### Demos
 
 ```sh
-# Terminal browser for the businesses/people tables (feature B). Same
+# Terminal browser for the businesses/people tables. Same
 # --graph-url / --config-dir (or DKG_GRAPH_DATABASE_URL / DKG_CONFIG_DIR) as
 # `dkg table query` — connects to ClickHouse directly, no HTTP server needed.
 cargo run -p prospects-tui --release
@@ -263,10 +264,10 @@ cargo run -p prospects-tui --release
 In-depth guides live in [`docs/`](docs/):
 
 - [Overview](docs/README.md) — how the capabilities fit together
-- [Documents (A)](docs/documents.md)
-- [Relational records (B)](docs/relational.md)
-- [Endpoints (C)](docs/endpoints.md)
-- [Jobs (D)](docs/jobs.md)
+- [Documents](docs/documents.md)
+- [Relational records](docs/relational.md)
+- [Endpoints](docs/endpoints.md)
+- [Jobs](docs/jobs.md)
 - [Facts & overview resolution](docs/facts.md)
 - [Configuration reference](docs/configuration.md)
 

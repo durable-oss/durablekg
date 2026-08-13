@@ -1,6 +1,6 @@
-# Relational records (feature B)
+# Relational records
 
-Feature B stores typed, queryable business records — `people`, `businesses`,
+Relational records store typed, queryable business records — `people`, `businesses`,
 and the like — in ClickHouse. It is the *target shape* that facts resolve into.
 
 This is **not** a node/edge graph. Each table is its own entity declaring only
@@ -104,7 +104,7 @@ appending a duplicate. This is what makes an entity's overview re-syncable (see
 
 A record is a JSON object keyed by column name. `id` is system-managed: an
 insert that sets `id` is rejected (`column `id` is system-managed and cannot be
-set on insert`). These routes error unless feature B is configured
+set on insert`). These routes error unless relational records are configured
 (`DKG_GRAPH_DATABASE_URL` set).
 
 `filters` is a list of `{column, op, value}` predicates, ANDed together. `op`

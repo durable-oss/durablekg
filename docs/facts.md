@@ -1,6 +1,6 @@
 # Facts & overview resolution
 
-The relational schema (feature B) describes the *target shape* of an entity —
+The relational schema describes the *target shape* of an entity —
 the `businesses` table and its columns. **Facts** are the layer beneath it:
 where observations land before they are resolved into a row. The schema author
 never authors facts and never edits the schema to enable them. Adding a column
@@ -63,7 +63,7 @@ recorded fact; any of them resolves to the same entity.
 ## Storage: facts ride on documents
 
 `dkg-facts` has **no backend of its own**. Each fact is persisted as a document
-(feature A) in a per-table collection named `facts:<table>`, where `<table>` is
+in a per-table collection named `facts:<table>`, where `<table>` is
 the entity URN's namespace. The resolution-relevant fields are lifted into the
 document's queryable metadata, so the three access patterns hit existing
 indexes:
@@ -96,7 +96,7 @@ concrete table: it keeps only the dimensions that are real columns (dropping
 the rest — the "accept any dimension" contract). The overview it produces
 carries **no `id`** — `id` is system-owned and assigned by sync, not derived
 from the URN. The result is a record ready to insert into the entity's
-feature-B table.
+relational table.
 
 ## Sync: upsert the overview by alias
 
@@ -172,11 +172,12 @@ dkg fact sync --entity urn:businesses:slug:acme-roofing-co \
 | Method | Path | Body / query | Description |
 | ------ | ---- | ------------ | ----------- |
 | POST | `/v1/facts` | a `NewFact` | Record one fact |
+| POST | `/v1/facts/batch` | array of `NewBundle` | Record many bundles |
 | GET  | `/v1/facts` | `?entity=&dimension=` | List an entity's facts |
 | POST | `/v1/facts/resolve` | `{ "entity": "urn:..." }` | Resolve → overview record (read-only) |
 | POST | `/v1/facts/sync` | `{ "entity": "urn:..." }` | Resolve + write the row |
 
-`resolve` and `sync` require feature B (they need the table shape). Recording
+`resolve` and `sync` require relational records (they need the table shape). Recording
 and listing need only the document store.
 
 Example — record then resolve:
@@ -194,9 +195,50 @@ curl -X POST localhost:8080/v1/facts/resolve -H 'content-type: application/json'
 # → { "phone": "603-555-1234", ... }   (no `id` — it is system-owned)
 ```
 
-## Relationship to feature D
+Batch import — note this takes **bundles**, not a flat list of facts:
 
-`sync_entity` is the per-entity form of a feature-D job. The feature-D
+```sh
+curl -X POST localhost:8080/v1/facts/batch -H 'content-type: application/json' -d '[
+  { "entity": "urn:businesses:slug:acme-roofing-co",
+    "authority": { "source_type": "website_scrape", "confidence": 0.9 },
+    "dimensions": { "phone": "603-555-1234", "name": "Acme Roofing" } },
+  { "entity": "urn:businesses:slug:globex",
+    "authority": { "source_type": "website_scrape", "confidence": 0.9 },
+    "dimensions": { "phone": "603-555-9999" } }
+]'
+# → { "recorded": 3, "facts": [...] }
+```
+
+Two bundles, three facts: `recorded` counts facts, because a bundle explodes
+into one fact per dimension on the way back out.
+
+Bundles are the shape here because they are the storage-efficient unit — within
+a bundle the entity URN, authority, and timestamps are written once instead of
+once per dimension. That is the whole reason to batch facts rather than loop
+over `/v1/facts`. Facts that genuinely share no provenance still go in the same
+request; just send each as its own one-dimension bundle.
+
+Same rules as document batches: best-effort by default (every bundle attempted,
+failures reported per item, `200` all-ok / `207` if any failed), with
+`?on_error=stop` to halt at the first failure. One caveat specific to facts —
+`index` in `errors` refers to the input *bundle*, while `recorded` counts
+*facts*, so the two numbers are not on the same scale:
+
+```json
+{ "recorded": 3, "facts": [...],
+  "failed": 1,
+  "errors": [ { "index": 1, "error": "not a urn:namespace:id value: `BAD`" } ] }
+```
+
+Re-sending an already-recorded bundle
+is not an error — facts are append-only observations, so it records a second
+identical observation rather than being rejected. Resolution still picks one
+value per dimension by authority, so duplicates do not corrupt the overview,
+but they do add rows.
+
+## Relationship to bulk jobs
+
+`sync_entity` is the per-entity form of a bulk job. The job system's
 `Transform` is one-document-at-a-time and cannot resolve (resolution is
 inherently cross-document — it needs all of an entity's facts together). A bulk
 runner that groups fact documents by entity and calls the same resolve →

@@ -6,6 +6,8 @@
 //! tables / columns / join tables, never drop), then serves per-table
 //! inserts and queries plus relationship traversal.
 
+use std::collections::HashMap;
+
 use clickhouse::Client;
 use dkg_config::RelationKind;
 use dkg_core::{Error, Result};
@@ -14,6 +16,23 @@ use serde_json::Value;
 use crate::dml::{Filter, OrderBy, Record};
 use crate::schema::Schema;
 use crate::{ddl, dml};
+
+/// One entity to upsert as part of a batch: the row, the aliases identifying
+/// it, and optionally the physical uuid to write it under.
+///
+/// See [`ClickHouseStore::upsert_batch`].
+#[derive(Debug, Clone)]
+pub struct UpsertItem {
+    /// The overview row, without the system `id` column (which is stamped
+    /// from the resolved or supplied uuid).
+    pub record: Record,
+    /// The `(alias_type, alias_value)` pairs identifying this entity.
+    pub aliases: Vec<(String, String)>,
+    /// A caller-supplied physical uuid. `Some` when the entity was addressed
+    /// by `urn:<table>:id:<uuid>`; `None` to resolve from the aliases or mint
+    /// a fresh one.
+    pub id: Option<String>,
+}
 
 /// Escape literal `?` for the `clickhouse` crate's query builder.
 ///
@@ -292,6 +311,141 @@ impl ClickHouseStore {
             .and_then(|r| r.get("entity_id").and_then(Value::as_str).map(String::from)))
     }
 
+    /// Resolve many `(alias_type, alias_value)` pairs in a single query,
+    /// returning a map from pair to the `entity_id` it points at. Pairs with
+    /// no mapping are absent from the map.
+    ///
+    /// This is the bulk form of [`resolve_alias`](Self::resolve_alias): one
+    /// round trip for the whole set instead of one per alias.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the table is undefined, or
+    /// [`Error::Storage`] on backend failure.
+    pub async fn resolve_aliases(
+        &self,
+        schema: &Schema,
+        table: &str,
+        aliases: &[(String, String)],
+    ) -> Result<HashMap<(String, String), String>> {
+        let mut out = HashMap::new();
+        if aliases.is_empty() {
+            return Ok(out);
+        }
+        let table = schema.table(table)?;
+        let alias_table = ddl::alias_table_name(table);
+
+        // Deduplicate: the same alias often identifies several entities in a
+        // batch, and repeating it just inflates the predicate.
+        let unique: Vec<(String, String)> = aliases
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .cloned()
+            .collect();
+
+        let sql = dml::select_aliases_sql(&alias_table, &unique);
+        for row in self.fetch_records(&sql).await? {
+            let (Some(alias_type), Some(alias_value), Some(entity_id)) = (
+                row.get("alias_type").and_then(Value::as_str),
+                row.get("alias_value").and_then(Value::as_str),
+                row.get("entity_id").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            out.insert(
+                (alias_type.to_string(), alias_value.to_string()),
+                entity_id.to_string(),
+            );
+        }
+        Ok(out)
+    }
+
+    /// Every `(alias_type, alias_value)` registered for `entity_id`.
+    ///
+    /// The reverse of [`resolve_alias`](Self::resolve_alias), used to find all
+    /// the names an entity's facts might have been recorded under.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the table is undefined, or
+    /// [`Error::Storage`] on backend failure.
+    pub async fn aliases_for_entity(
+        &self,
+        schema: &Schema,
+        table: &str,
+        entity_id: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let table = schema.table(table)?;
+        if table.alternate_keys.is_empty() {
+            // No alias table exists for a table without alternate keys.
+            return Ok(Vec::new());
+        }
+        let alias_table = ddl::alias_table_name(table);
+        let sql = dml::select_aliases_for_entity_sql(&alias_table, entity_id);
+        Ok(self
+            .fetch_records(&sql)
+            .await?
+            .into_iter()
+            .filter_map(|row| {
+                let alias_type = row.get("alias_type").and_then(Value::as_str)?;
+                let alias_value = row.get("alias_value").and_then(Value::as_str)?;
+                Some((alias_type.to_string(), alias_value.to_string()))
+            })
+            .collect())
+    }
+
+    /// Every `(alias_type, alias_value)` registered for each of `entity_ids`,
+    /// keyed by entity id, in one query.
+    ///
+    /// The bulk form of [`aliases_for_entity`](Self::aliases_for_entity):
+    /// one round trip for a whole batch instead of one per entity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the table is undefined, or
+    /// [`Error::Storage`] on backend failure.
+    pub async fn aliases_for_entities(
+        &self,
+        schema: &Schema,
+        table: &str,
+        entity_ids: &[String],
+    ) -> Result<HashMap<String, Vec<(String, String)>>> {
+        let mut out: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        if entity_ids.is_empty() {
+            return Ok(out);
+        }
+        let table = schema.table(table)?;
+        if table.alternate_keys.is_empty() {
+            // No alias table exists for a table without alternate keys.
+            return Ok(out);
+        }
+        let alias_table = ddl::alias_table_name(table);
+
+        // Deduplicate: a batch commonly addresses one entity several times.
+        let unique: Vec<String> = entity_ids
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .cloned()
+            .collect();
+
+        let sql = dml::select_aliases_for_entities_sql(&alias_table, &unique);
+        for row in self.fetch_records(&sql).await? {
+            let (Some(alias_type), Some(alias_value), Some(entity_id)) = (
+                row.get("alias_type").and_then(Value::as_str),
+                row.get("alias_value").and_then(Value::as_str),
+                row.get("entity_id").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            out.entry(entity_id.to_string())
+                .or_default()
+                .push((alias_type.to_string(), alias_value.to_string()));
+        }
+        Ok(out)
+    }
+
     /// Upsert `record` into `table` keyed by `aliases`, returning the system
     /// `id` it was written under. Mints a fresh uuid when no alias resolves,
     /// reuses the single resolved uuid, or errors on a merge conflict (aliases
@@ -358,6 +512,125 @@ impl ClickHouseStore {
         self.write_row_and_aliases(schema, table_def, record, id, aliases)
             .await?;
         Ok(id.to_string())
+    }
+
+    /// Upsert many records into one `table` in a single pass.
+    ///
+    /// Each item is a record plus the aliases identifying it, and optionally a
+    /// caller-supplied physical uuid (the entity was addressed by
+    /// `urn:<table>:id:<uuid>`). Returns the system `id` written for each
+    /// item, in input order.
+    ///
+    /// Where the per-entity path costs a round trip per alias plus a
+    /// single-row `INSERT`, this costs **one** alias `SELECT`, **one** row
+    /// `INSERT`, and **one** alias `INSERT` for the whole batch. Single-row
+    /// inserts are ClickHouse's documented worst case, so this is the
+    /// difference that matters for bulk sync.
+    ///
+    /// Items are resolved against both the existing alias table *and* each
+    /// other: two items in one batch sharing an alias resolve to the same
+    /// uuid, exactly as they would if synced one after the other.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the table is undefined,
+    /// [`Error::Invalid`] on a bad record, an unparseable supplied id, or an
+    /// alias merge conflict, or [`Error::Storage`] on backend failure.
+    ///
+    /// The write is **not** transactional: a failure of the alias insert
+    /// leaves the rows written. Re-running the same batch is safe, since every
+    /// table is a `ReplacingMergeTree` keyed by `id`.
+    pub async fn upsert_batch(
+        &self,
+        schema: &Schema,
+        table: &str,
+        items: &[UpsertItem],
+    ) -> Result<Vec<String>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let table_def = schema.table(table)?;
+
+        // One query resolves every alias in the batch.
+        let all_aliases: Vec<(String, String)> =
+            items.iter().flat_map(|i| i.aliases.clone()).collect();
+        let mut resolved = self.resolve_aliases(schema, table, &all_aliases).await?;
+
+        let mut ids = Vec::with_capacity(items.len());
+        for item in items {
+            let hits: Vec<(&(String, String), &String)> = item
+                .aliases
+                .iter()
+                .filter_map(|a| resolved.get(a).map(|id| (a, id)))
+                .collect();
+
+            let distinct: std::collections::BTreeSet<&str> =
+                hits.iter().map(|(_, u)| u.as_str()).collect();
+
+            let id = match (&item.id, distinct.len()) {
+                // A caller-supplied uuid wins outright; aliases are then
+                // (re)pointed at it, matching `upsert_by_aliases_with_id`.
+                (Some(supplied), _) => {
+                    uuid::Uuid::parse_str(supplied).map_err(|_| {
+                        Error::Invalid(format!("entity id `{supplied}` is not a valid uuid"))
+                    })?;
+                    supplied.clone()
+                }
+                (None, 0) => uuid::Uuid::new_v4().to_string(),
+                (None, 1) => (*distinct.iter().next().unwrap()).to_string(),
+                (None, _) => {
+                    let detail = hits
+                        .iter()
+                        .map(|((t, v), u)| format!("{t}={v} -> {u}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(Error::Invalid(format!(
+                        "alias conflict on `{table}`: {detail}; refusing to merge distinct records"
+                    )));
+                }
+            };
+
+            // Fold this item's aliases into the resolution map so a later
+            // item sharing an alias lands on the same uuid — the behaviour
+            // sequential per-entity syncs would produce.
+            for alias in &item.aliases {
+                resolved.insert(alias.clone(), id.clone());
+            }
+            ids.push(id);
+        }
+
+        // One INSERT for every row in the batch.
+        let rows: Vec<Record> = items
+            .iter()
+            .zip(&ids)
+            .map(|(item, id)| {
+                let mut row = item.record.clone();
+                row.insert(
+                    dkg_config::Table::ID_COLUMN.to_string(),
+                    Value::String(id.clone()),
+                );
+                row
+            })
+            .collect();
+        self.execute(&dml::insert_sql(table_def, &rows)?).await?;
+
+        // One INSERT for every alias mapping in the batch.
+        let alias_rows: Vec<(String, String, String)> = items
+            .iter()
+            .zip(&ids)
+            .flat_map(|(item, id)| {
+                item.aliases
+                    .iter()
+                    .map(move |(t, v)| (t.clone(), v.clone(), id.clone()))
+            })
+            .collect();
+        if !alias_rows.is_empty() {
+            let alias_table = ddl::alias_table_name(table_def);
+            self.execute(&dml::insert_alias_rows_sql(&alias_table, &alias_rows))
+                .await?;
+        }
+
+        Ok(ids)
     }
 
     /// Write the row under `id`, then (re)register every alias to point at it.
